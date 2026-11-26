@@ -28,13 +28,6 @@ mod test {
                 state.push(format!("direct {owner:?} {name} {definitions:?}"));
             }
         }
-        for (owner, fields) in index.iter_all_owner_fields() {
-            for (name, files) in fields {
-                let mut files = files.iter().copied().collect::<Vec<_>>();
-                files.sort_unstable();
-                state.push(format!("files {owner:?} {name} {files:?}"));
-            }
-        }
         for (name, sites) in index.iter_all_unattributed_fields() {
             let mut sites = sites.iter().cloned().collect::<Vec<_>>();
             sites.sort_by_key(|site| (site.file_id, site.value.start()));

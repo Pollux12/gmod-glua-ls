@@ -1,5 +1,7 @@
 use std::hash::Hash;
+use std::ops::Deref;
 
+use internment::ArcIntern;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::db_index::cow_shards::CowShards;
@@ -88,6 +90,135 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
         })
 }
 
+/// Sorted, deduplicated definition sites for one `(owner, field_name)` slot.
+/// Most slots hold one site, which lives inline with no heap allocation.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct DefSites(DefSitesInner);
+
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+enum DefSitesInner {
+    #[default]
+    Empty,
+    One(InFiled<TextRange>),
+    Many(Box<[InFiled<TextRange>]>),
+}
+
+const _: () = assert!(std::mem::size_of::<DefSites>() == 24);
+
+impl Deref for DefSites {
+    type Target = [InFiled<TextRange>];
+
+    fn deref(&self) -> &[InFiled<TextRange>] {
+        match &self.0 {
+            DefSitesInner::Empty => &[],
+            DefSitesInner::One(site) => std::slice::from_ref(site),
+            DefSitesInner::Many(sites) => sites,
+        }
+    }
+}
+
+impl std::fmt::Debug for DefSites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for &'a DefSites {
+    type Item = &'a InFiled<TextRange>;
+    type IntoIter = std::slice::Iter<'a, InFiled<TextRange>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl DefSites {
+    fn from_vec(sites: Vec<InFiled<TextRange>>) -> Self {
+        Self(match sites.len() {
+            0 => DefSitesInner::Empty,
+            1 => DefSitesInner::One(sites[0].clone()),
+            _ => DefSitesInner::Many(sites.into_boxed_slice()),
+        })
+    }
+
+    fn as_slice(&self) -> &[InFiled<TextRange>] {
+        self
+    }
+
+    fn insert_sorted(&mut self, definition: InFiled<TextRange>) -> bool {
+        let at = self.partition_point(|existing| {
+            definition_sort_key(existing) < definition_sort_key(&definition)
+        });
+        if self.get(at) == Some(&definition) {
+            return false;
+        }
+        match &mut self.0 {
+            DefSitesInner::Empty => self.0 = DefSitesInner::One(definition),
+            DefSitesInner::One(existing) => {
+                let existing = existing.clone();
+                let pair = if at == 0 {
+                    [definition, existing]
+                } else {
+                    [existing, definition]
+                };
+                self.0 = DefSitesInner::Many(Box::new(pair));
+            }
+            DefSitesInner::Many(sites) => {
+                let mut vec = Vec::with_capacity(sites.len() + 1);
+                vec.extend_from_slice(&sites[..at]);
+                vec.push(definition);
+                vec.extend_from_slice(&sites[at..]);
+                self.0 = DefSitesInner::Many(vec.into_boxed_slice());
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, definition: &InFiled<TextRange>) -> bool {
+        match &mut self.0 {
+            DefSitesInner::Empty => false,
+            DefSitesInner::One(existing) => {
+                if existing == definition {
+                    self.0 = DefSitesInner::Empty;
+                    true
+                } else {
+                    false
+                }
+            }
+            DefSitesInner::Many(sites) => {
+                let Some(at) = sites.iter().position(|existing| existing == definition) else {
+                    return false;
+                };
+                if sites.len() == 2 {
+                    self.0 = DefSitesInner::One(sites[1 - at].clone());
+                } else {
+                    let mut vec = Vec::with_capacity(sites.len() - 1);
+                    vec.extend_from_slice(&sites[..at]);
+                    vec.extend_from_slice(&sites[at + 1..]);
+                    self.0 = DefSitesInner::Many(vec.into_boxed_slice());
+                }
+                true
+            }
+        }
+    }
+
+    fn merge_from(&mut self, other: DefSites) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        let mut merged = Vec::with_capacity(self.len() + other.len());
+        merged.extend_from_slice(self);
+        merged.extend_from_slice(&other);
+        merged.sort_unstable_by_key(definition_sort_key);
+        merged.dedup();
+        *self = Self::from_vec(merged);
+    }
+}
+
 /// Index tracking dynamically-assigned fields on typed variables.
 ///
 /// When `gmod.inferDynamicFields` is enabled, field assignments like
@@ -95,13 +226,10 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
 /// `InjectField` and `UndefinedField` diagnostics can be suppressed.
 #[derive(Debug, Default, Clone)]
 pub struct DynamicFieldIndex {
-    /// owner → (field_name → set of files that assign this field)
-    owner_fields: CowShards<DynamicFieldOwner, HashMap<SmolStr, HashSet<FileId>>>,
-    /// owner → (field_name → assignment locations)
-    field_definitions: CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    /// owner → (field_name → assignment locations); also answers assigning-file queries.
+    field_definitions: CowShards<DynamicFieldOwner, HashMap<SmolStr, DefSites>>,
     /// Exact fields collected on their original owner, excluding inherited propagation.
-    direct_field_definitions:
-        CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    direct_field_definitions: CowShards<DynamicFieldOwner, HashMap<SmolStr, DefSites>>,
     /// Expression-key members whose complete string domain was resolved to finite names.
     finite_named_members: CowShards<DynamicFieldOwner, HashSet<LuaMemberId>>,
     /// owner → assignment locations for writes through non-literal keys.
@@ -128,43 +256,204 @@ pub struct DynamicFieldIndex {
 
 /// What one write site filed, each list in the order its derivation filed
 /// it: one derivation fills a site, so the order is that computation's.
+/// Most write sites file a single named field, which lives inline.
 #[derive(Debug, Clone, Default, PartialEq)]
-struct SiteContributions {
+enum SiteContributions {
+    #[default]
+    Empty,
+    OneNamed(DynamicFieldOwner, ArcIntern<SmolStr>, TextRange),
+    Many(Box<SiteContributionsData>),
+}
+
+const _: () = assert!(std::mem::size_of::<SiteContributions>() <= 48);
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SiteContributionsData {
     /// Definitions new to the union of direct and propagated definitions.
-    named: Vec<(DynamicFieldOwner, SmolStr, TextRange)>,
+    named: Vec<(DynamicFieldOwner, ArcIntern<SmolStr>, TextRange)>,
     wildcards: Vec<(DynamicFieldOwner, TextRange)>,
     finite: Vec<(DynamicFieldOwner, LuaMemberId)>,
-    unattributed: Vec<(SmolStr, TextRange)>,
+    unattributed: Vec<(ArcIntern<SmolStr>, TextRange)>,
 }
 
 impl SiteContributions {
     fn is_empty(&self) -> bool {
-        self.named.is_empty()
-            && self.wildcards.is_empty()
-            && self.finite.is_empty()
-            && self.unattributed.is_empty()
+        match self {
+            Self::Empty => true,
+            Self::OneNamed(..) => false,
+            Self::Many(data) => {
+                data.named.is_empty()
+                    && data.wildcards.is_empty()
+                    && data.finite.is_empty()
+                    && data.unattributed.is_empty()
+            }
+        }
+    }
+
+    fn normalize(&mut self) {
+        if let Self::Many(data) = self {
+            if data.wildcards.is_empty() && data.finite.is_empty() && data.unattributed.is_empty() {
+                match data.named.len() {
+                    0 => *self = Self::Empty,
+                    1 => {
+                        let (owner, name, range) = data.named.pop().unwrap();
+                        *self = Self::OneNamed(owner, name, range);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn as_many_mut(&mut self) -> &mut SiteContributionsData {
+        match self {
+            Self::Empty => {
+                *self = Self::Many(Box::default());
+                let Self::Many(data) = self else {
+                    unreachable!()
+                };
+                data
+            }
+            Self::OneNamed(..) => {
+                let Self::OneNamed(owner, name, range) = std::mem::take(self) else {
+                    unreachable!()
+                };
+                let mut data = Box::new(SiteContributionsData::default());
+                data.named.push((owner, name, range));
+                *self = Self::Many(data);
+                let Self::Many(data) = self else {
+                    unreachable!()
+                };
+                data
+            }
+            Self::Many(data) => data,
+        }
+    }
+
+    fn push_named(&mut self, owner: DynamicFieldOwner, field_name: SmolStr, range: TextRange) {
+        let field_name = ArcIntern::new(field_name);
+        match self {
+            Self::Empty => *self = Self::OneNamed(owner, field_name, range),
+            Self::OneNamed(..) | Self::Many(_) => {
+                self.as_many_mut().named.push((owner, field_name, range));
+            }
+        }
+    }
+
+    fn push_wildcard(&mut self, owner: DynamicFieldOwner, range: TextRange) {
+        let wildcards = &mut self.as_many_mut().wildcards;
+        reserve_first(wildcards);
+        wildcards.push((owner, range));
+    }
+
+    fn push_finite(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
+        let finite = &mut self.as_many_mut().finite;
+        reserve_first(finite);
+        finite.push((owner, member_id));
+    }
+
+    fn push_unattributed(&mut self, field_name: SmolStr, range: TextRange) {
+        let unattributed = &mut self.as_many_mut().unattributed;
+        reserve_first(unattributed);
+        unattributed.push((ArcIntern::new(field_name), range));
+    }
+
+    fn remove_finite(&mut self, owner: &DynamicFieldOwner, member_id: &LuaMemberId) {
+        if let Self::Many(data) = self {
+            data.finite.retain(|(o, m)| o != owner || m != member_id);
+            self.normalize();
+        }
+    }
+
+    fn retain_owners(&mut self, keep: impl Fn(&DynamicFieldOwner) -> bool) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::OneNamed(owner, _, _) => {
+                if keep(owner) {
+                    false
+                } else {
+                    *self = Self::Empty;
+                    true
+                }
+            }
+            Self::Many(data) => {
+                let before = data.named.len() + data.wildcards.len() + data.finite.len();
+                data.named.retain(|(owner, _, _)| keep(owner));
+                data.wildcards.retain(|(owner, _)| keep(owner));
+                data.finite.retain(|(owner, _)| keep(owner));
+                let after = data.named.len() + data.wildcards.len() + data.finite.len();
+                self.normalize();
+                after != before
+            }
+        }
+    }
+
+    fn remap_owners(
+        &mut self,
+        mut remap: impl FnMut(&DynamicFieldOwner) -> Option<DynamicFieldOwner>,
+    ) {
+        match self {
+            Self::Empty => {}
+            Self::OneNamed(owner, _, _) => {
+                if let Some(new) = remap(owner) {
+                    *owner = new;
+                }
+            }
+            Self::Many(data) => {
+                let owners = data
+                    .named
+                    .iter_mut()
+                    .map(|(owner, _, _)| owner)
+                    .chain(data.wildcards.iter_mut().map(|(owner, _)| owner))
+                    .chain(data.finite.iter_mut().map(|(owner, _)| owner));
+                for owner in owners {
+                    if let Some(new) = remap(owner) {
+                        *owner = new;
+                    }
+                }
+            }
+        }
     }
 }
 
 /// Ranges hash as positions of the site's file, which fingerprinting sets.
 impl std::hash::Hash for SiteContributions {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.named.len().hash(state);
-        for (owner, field_name, range) in &self.named {
-            owner.hash(state);
-            field_name.hash(state);
-            derivation::hash_local(range, state);
-        }
-        self.wildcards.len().hash(state);
-        for (owner, range) in &self.wildcards {
-            owner.hash(state);
-            derivation::hash_local(range, state);
-        }
-        self.finite.hash(state);
-        self.unattributed.len().hash(state);
-        for (field_name, range) in &self.unattributed {
-            field_name.hash(state);
-            derivation::hash_local(range, state);
+        match self {
+            Self::Empty => {
+                0usize.hash(state);
+                0usize.hash(state);
+                (&[] as &[(DynamicFieldOwner, LuaMemberId)]).hash(state);
+                0usize.hash(state);
+            }
+            Self::OneNamed(owner, field_name, range) => {
+                1usize.hash(state);
+                owner.hash(state);
+                field_name.as_str().hash(state);
+                derivation::hash_local(range, state);
+                0usize.hash(state);
+                (&[] as &[(DynamicFieldOwner, LuaMemberId)]).hash(state);
+                0usize.hash(state);
+            }
+            Self::Many(data) => {
+                data.named.len().hash(state);
+                for (owner, field_name, range) in &data.named {
+                    owner.hash(state);
+                    field_name.as_str().hash(state);
+                    derivation::hash_local(range, state);
+                }
+                data.wildcards.len().hash(state);
+                for (owner, range) in &data.wildcards {
+                    owner.hash(state);
+                    derivation::hash_local(range, state);
+                }
+                data.finite.as_slice().hash(state);
+                data.unattributed.len().hash(state);
+                for (field_name, range) in &data.unattributed {
+                    field_name.as_str().hash(state);
+                    derivation::hash_local(range, state);
+                }
+            }
         }
     }
 }
@@ -197,16 +486,13 @@ fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
 /// Merges one owner's named definitions into another's, per field name, so a
 /// name both hold keeps the definitions of each.
 fn merge_field_definitions(
-    into: &mut HashMap<SmolStr, Vec<InFiled<TextRange>>>,
-    from: HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+    into: &mut HashMap<SmolStr, DefSites>,
+    from: HashMap<SmolStr, DefSites>,
 ) {
     for (field_name, definitions) in from {
         // The canonical order and the no-duplicates rule `add_field_inner`
         // maintains on insert have to survive the merge.
-        let slot = into.entry(field_name).or_default();
-        slot.extend(definitions);
-        slot.sort_unstable_by_key(definition_sort_key);
-        slot.dedup();
+        into.entry(field_name).or_default().merge_from(definitions);
     }
 }
 
@@ -241,6 +527,23 @@ fn merge_definitions(
     fork: Option<&Vec<InFiled<TextRange>>>,
 ) -> crate::db_index::cow_shards::Merged {
     crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, definition_sort_key)
+}
+
+fn merge_def_sites(
+    current: &mut Option<DefSites>,
+    frozen: Option<&DefSites>,
+    fork: Option<&DefSites>,
+) -> crate::db_index::cow_shards::Merged {
+    let to_vec = |sites: Option<&DefSites>| sites.map(|sites| sites.to_vec());
+    let mut merged = to_vec(current.as_ref());
+    crate::db_index::cow_shards::merge_sorted_by(
+        &mut merged,
+        to_vec(frozen).as_ref(),
+        to_vec(fork).as_ref(),
+        definition_sort_key,
+    )?;
+    *current = merged.map(DefSites::from_vec);
+    Ok(())
 }
 
 fn merge_wildcard_definitions(into: &mut Vec<InFiled<TextRange>>, from: Vec<InFiled<TextRange>>) {
@@ -284,7 +587,7 @@ impl DynamicFieldIndex {
             .or_default()
             .entry(field_name.clone())
             .or_default();
-        let is_new_direct = insert_definition(direct_definitions, definition);
+        let is_new_direct = direct_definitions.insert_sorted(definition);
         if is_new_direct && let DynamicFieldOwner::Type(type_id) = &owner {
             let held = self
                 .declaring_types
@@ -333,27 +636,17 @@ impl DynamicFieldIndex {
         field_name: SmolStr,
         range: TextRange,
     ) -> bool {
-        self.owner_fields
-            .entry(owner.clone())
-            .or_default()
-            .entry(field_name.clone())
-            .or_default()
-            .insert(site.file_id);
-
         let field_definitions = self
             .field_definitions
             .entry(owner.clone())
             .or_default()
             .entry(field_name.clone())
             .or_default();
-        let is_new_definition =
-            insert_definition(field_definitions, InFiled::new(site.file_id, range));
+        let is_new_definition = field_definitions.insert_sorted(InFiled::new(site.file_id, range));
 
         if is_new_definition {
             self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
-            let named = &mut self.site_record(site).named;
-            reserve_first(named);
-            named.push((owner, field_name, range));
+            self.site_record(site).push_named(owner, field_name, range);
         }
         is_new_definition
     }
@@ -371,9 +664,7 @@ impl DynamicFieldIndex {
         let is_new_definition = insert_definition(definitions, definition);
         if is_new_definition {
             derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
-            let wildcards = &mut self.site_record(site).wildcards;
-            reserve_first(wildcards);
-            wildcards.push((owner, range));
+            self.site_record(site).push_wildcard(owner, range);
         }
         is_new_definition
     }
@@ -406,9 +697,7 @@ impl DynamicFieldIndex {
             .insert(InFiled::new(site.file_id, range));
         if is_new {
             derivation::note_write(|| FactKey::UnattributedField(field_name.as_str().into()));
-            let unattributed = &mut self.site_record(site).unattributed;
-            reserve_first(unattributed);
-            unattributed.push((field_name, range));
+            self.site_record(site).push_unattributed(field_name, range);
         }
         is_new
     }
@@ -421,44 +710,51 @@ impl DynamicFieldIndex {
             return;
         };
         let file_id = site.file_id;
-        for (owner, field_name, range) in contributions.named {
-            self.retract_named(file_id, &owner, &field_name, range);
-        }
-        for (owner, range) in contributions.wildcards {
-            let definition = InFiled::new(file_id, range);
-            if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
-                definitions.retain(|existing| existing != &definition);
-                if definitions.is_empty() {
-                    self.wildcard_definitions.remove(&owner);
-                }
+        match contributions {
+            SiteContributions::Empty => {}
+            SiteContributions::OneNamed(owner, field_name, range) => {
+                self.retract_named(file_id, &owner, &field_name, range);
             }
-            derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
-        }
-        for (owner, member_id) in contributions.finite {
-            derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
-            if let Some(members) = self.finite_named_members.get_mut(&owner) {
-                members.remove(&member_id);
-                if members.is_empty() {
-                    self.finite_named_members.remove(&owner);
+            SiteContributions::Many(data) => {
+                for (owner, field_name, range) in data.named {
+                    self.retract_named(file_id, &owner, &field_name, range);
                 }
-            }
-        }
-        for (field_name, range) in contributions.unattributed {
-            derivation::note_write(|| FactKey::UnattributedField(field_name.as_str().into()));
-            let definition = InFiled::new(file_id, range);
-            if let Some(sites) = self.unattributed_fields.get_mut(field_name.as_str()) {
-                sites.remove(&definition);
-                if sites.is_empty() {
-                    self.unattributed_fields.remove(field_name.as_str());
+                for (owner, range) in data.wildcards {
+                    let definition = InFiled::new(file_id, range);
+                    if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
+                        definitions.retain(|existing| existing != &definition);
+                        if definitions.is_empty() {
+                            self.wildcard_definitions.remove(&owner);
+                        }
+                    }
+                    derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
+                }
+                for (owner, member_id) in data.finite {
+                    derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
+                    if let Some(members) = self.finite_named_members.get_mut(&owner) {
+                        members.remove(&member_id);
+                        if members.is_empty() {
+                            self.finite_named_members.remove(&owner);
+                        }
+                    }
+                }
+                for (field_name, range) in data.unattributed {
+                    derivation::note_write(|| {
+                        FactKey::UnattributedField(field_name.as_str().into())
+                    });
+                    let definition = InFiled::new(file_id, range);
+                    if let Some(sites) = self.unattributed_fields.get_mut(field_name.as_str()) {
+                        sites.remove(&definition);
+                        if sites.is_empty() {
+                            self.unattributed_fields.remove(field_name.as_str());
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Withdraws one named definition from the union and the direct set. The
-    /// file keeps its slot while another of its definitions on the same
-    /// owner/field survives; only the file's last definition for the slot
-    /// frees it.
+    /// Withdraws one named definition from the union and the direct set.
     fn retract_named(
         &mut self,
         file_id: FileId,
@@ -492,26 +788,6 @@ impl DynamicFieldIndex {
         // Draining a definition is a novel fact for the slot's readers,
         // mirroring the signature index's removal tombstones.
         self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
-        let has_remaining = self
-            .field_definitions
-            .get(owner)
-            .and_then(|fields| fields.get(field_name.as_str()))
-            .is_some_and(|definitions| {
-                definitions
-                    .iter()
-                    .any(|definition| definition.file_id == file_id)
-            });
-        if !has_remaining && let Some(fields) = self.owner_fields.get_mut(owner) {
-            if let Some(files) = fields.get_mut(field_name.as_str()) {
-                files.remove(&file_id);
-                if files.is_empty() {
-                    fields.remove(field_name.as_str());
-                }
-            }
-            if fields.is_empty() {
-                self.owner_fields.remove(owner);
-            }
-        }
         self.settle_named(owner, field_name, old_slot);
     }
 
@@ -527,17 +803,24 @@ impl DynamicFieldIndex {
         // entries are exactly its literals' owners.
         let file_id = remap.file_id;
         let owners: HashSet<DynamicFieldOwner> = self
-            .owner_fields
+            .field_definitions
             .file_entries(file_id)
             .map(|(owner, _)| owner)
-            .chain(self.field_definitions.file_entries(file_id).map(|(owner, _)| owner))
             .chain(
                 self.direct_field_definitions
                     .file_entries(file_id)
                     .map(|(owner, _)| owner),
             )
-            .chain(self.finite_named_members.file_entries(file_id).map(|(owner, _)| owner))
-            .chain(self.wildcard_definitions.file_entries(file_id).map(|(owner, _)| owner))
+            .chain(
+                self.finite_named_members
+                    .file_entries(file_id)
+                    .map(|(owner, _)| owner),
+            )
+            .chain(
+                self.wildcard_definitions
+                    .file_entries(file_id)
+                    .map(|(owner, _)| owner),
+            )
             .filter(|owner| {
                 matches!(owner, DynamicFieldOwner::Table(range) if range.file_id == file_id)
             })
@@ -578,7 +861,7 @@ impl DynamicFieldIndex {
                 self.owner_named_fingerprints.remove(owner);
                 // Dropping the group is a novel fact for its readers.
                 let field_names = self
-                    .owner_fields
+                    .field_definitions
                     .get(owner)
                     .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
@@ -589,7 +872,6 @@ impl DynamicFieldIndex {
                 if has_wildcards {
                     derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
                 }
-                self.owner_fields.remove(owner);
                 self.field_definitions.remove(owner);
                 self.direct_field_definitions.remove(owner);
                 self.finite_named_members.remove(owner);
@@ -599,14 +881,7 @@ impl DynamicFieldIndex {
                 let Some(entries) = self.site_contributions.get_mut(&site) else {
                     continue;
                 };
-                let contributions = |entries: &SiteContributions| {
-                    entries.named.len() + entries.wildcards.len() + entries.finite.len()
-                };
-                let before = contributions(entries);
-                entries.named.retain(|(owner, _, _)| !lost.contains(owner));
-                entries.wildcards.retain(|(owner, _)| !lost.contains(owner));
-                entries.finite.retain(|(owner, _)| !lost.contains(owner));
-                if contributions(entries) != before {
+                if entries.retain_owners(|owner| !lost.contains(owner)) {
                     dirty.push(crate::LostFact::new(
                         site.file_id,
                         FactKey::DynamicFieldSite(site.clone()),
@@ -621,8 +896,7 @@ impl DynamicFieldIndex {
     }
 
     fn holds_owner(&self, owner: &DynamicFieldOwner) -> bool {
-        self.owner_fields.contains_key(owner)
-            || self.field_definitions.contains_key(owner)
+        self.field_definitions.contains_key(owner)
             || self.direct_field_definitions.contains_key(owner)
             || self.finite_named_members.contains_key(owner)
             || self.wildcard_definitions.contains_key(owner)
@@ -641,13 +915,6 @@ impl DynamicFieldIndex {
                     .flat_map(HashMap::values)
                     .flatten()
                     .map(|definition| definition.file_id);
-                let assigning = self
-                    .owner_fields
-                    .get(owner)
-                    .into_iter()
-                    .flat_map(HashMap::values)
-                    .flatten()
-                    .copied();
                 let wildcards = self
                     .wildcard_definitions
                     .get(owner)
@@ -660,7 +927,7 @@ impl DynamicFieldIndex {
                     .into_iter()
                     .flatten()
                     .map(|member_id| member_id.file_id);
-                named.chain(assigning).chain(wildcards).chain(finite)
+                named.chain(wildcards).chain(finite)
             })
             .collect::<Vec<_>>();
         files.sort_unstable();
@@ -735,11 +1002,6 @@ impl DynamicFieldIndex {
             self.note_whole_owner_write(owner);
         }
 
-        remap_owner_keyed!(self.owner_fields, |slot, group| {
-            for (field_name, files) in group {
-                slot.entry(field_name).or_default().extend(files);
-            }
-        });
         remap_owner_keyed!(self.field_definitions, |slot, group| {
             merge_field_definitions(slot, group)
         });
@@ -760,17 +1022,7 @@ impl DynamicFieldIndex {
             let Some(entries) = self.site_contributions.get_mut(&site) else {
                 continue;
             };
-            let owners = entries
-                .named
-                .iter_mut()
-                .map(|(owner, _, _)| owner)
-                .chain(entries.wildcards.iter_mut().map(|(owner, _)| owner))
-                .chain(entries.finite.iter_mut().map(|(owner, _)| owner));
-            for owner in owners {
-                if let Some(new) = remap_owner(owner, map) {
-                    *owner = new;
-                }
-            }
+            entries.remap_owners(|owner| remap_owner(owner, map));
         }
     }
 
@@ -794,26 +1046,37 @@ impl DynamicFieldIndex {
                 DynamicFieldOwner::Type(_) | DynamicFieldOwner::GlobalPath(_) => None,
             }
         }
-        self.owner_fields
+        let mut ranges: Vec<_> = self
+            .field_definitions
             .keys()
-            .chain(self.field_definitions.keys())
             .chain(self.direct_field_definitions.keys())
             .chain(self.finite_named_members.keys())
             .chain(self.wildcard_definitions.keys())
             .filter_map(owner_range)
-            .chain(self.site_contributions.values().flat_map(|entries| {
-                entries
-                    .named
-                    .iter()
-                    .filter_map(|(owner, _, _)| owner_range(owner))
-                    .chain(
-                        entries
-                            .wildcards
+            .collect();
+        for entries in self.site_contributions.values() {
+            match entries {
+                SiteContributions::Empty => {}
+                SiteContributions::OneNamed(owner, _, _) => {
+                    if let Some(range) = owner_range(owner) {
+                        ranges.push(range);
+                    }
+                }
+                SiteContributions::Many(data) => {
+                    ranges.extend(
+                        data.named
                             .iter()
-                            .filter_map(|(owner, _)| owner_range(owner)),
-                    )
-            }))
-            .collect()
+                            .filter_map(|(owner, _, _)| owner_range(owner))
+                            .chain(
+                                data.wildcards
+                                    .iter()
+                                    .filter_map(|(owner, _)| owner_range(owner)),
+                            ),
+                    );
+                }
+            }
+        }
+        ranges
     }
 
     pub fn has_unattributed_field(&self, field_name: &str) -> bool {
@@ -839,7 +1102,7 @@ impl DynamicFieldIndex {
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
         derivation::note_dynamic_field_read(owner, Some(field_name));
-        self.owner_fields
+        self.field_definitions
             .get(owner)
             .is_some_and(|fields| fields.contains_key(field_name))
     }
@@ -851,18 +1114,15 @@ impl DynamicFieldIndex {
         file_id: FileId,
     ) -> bool {
         derivation::note_dynamic_field_read(owner, Some(field_name));
-        self.owner_fields
+        self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
-            .is_some_and(|files| files.contains(&file_id))
+            .is_some_and(|defs| defs.iter().any(|def| def.file_id == file_id))
     }
 
-    pub fn get_fields(
-        &self,
-        owner: &DynamicFieldOwner,
-    ) -> Option<&HashMap<SmolStr, HashSet<FileId>>> {
+    pub fn get_fields(&self, owner: &DynamicFieldOwner) -> Option<&HashMap<SmolStr, DefSites>> {
         derivation::note_dynamic_field_read(owner, None);
-        self.owner_fields.get(owner)
+        self.field_definitions.get(owner)
     }
 
     /// Whether `owner` has a direct definition of `field_name`: read as that
@@ -877,7 +1137,7 @@ impl DynamicFieldIndex {
     pub fn get_direct_fields(
         &self,
         owner: &DynamicFieldOwner,
-    ) -> Option<&HashMap<SmolStr, Vec<InFiled<TextRange>>>> {
+    ) -> Option<&HashMap<SmolStr, DefSites>> {
         derivation::note_dynamic_field_read(owner, None);
         self.direct_field_definitions.get(owner)
     }
@@ -898,9 +1158,7 @@ impl DynamicFieldIndex {
             .insert(member_id);
         if is_new {
             derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
-            let finite = &mut self.site_record(site).finite;
-            reserve_first(finite);
-            finite.push((owner, member_id));
+            self.site_record(site).push_finite(owner, member_id);
         }
         is_new
     }
@@ -922,9 +1180,7 @@ impl DynamicFieldIndex {
             self.finite_named_members.remove(owner);
         }
         if let Some(contributions) = self.site_contributions.get_mut(site) {
-            contributions
-                .finite
-                .retain(|(o, m)| o != owner || m != &member_id);
+            contributions.remove_finite(owner, &member_id);
             if contributions.is_empty() {
                 self.site_contributions.remove(site);
             }
@@ -951,12 +1207,16 @@ impl DynamicFieldIndex {
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
         derivation::note_dynamic_field_read(owner, None);
-        self.owner_fields
+        self.field_definitions
             .get(owner)
             .map(|fields| {
                 fields
                     .iter()
-                    .filter_map(|(name, files)| files.contains(&file_id).then_some(name))
+                    .filter_map(|(name, defs)| {
+                        defs.iter()
+                            .any(|def| def.file_id == file_id)
+                            .then_some(name)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -972,7 +1232,7 @@ impl DynamicFieldIndex {
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
-            .map_or(&[], Vec::as_slice)
+            .map_or(&[], DefSites::as_slice)
     }
 
     /// The definitions of one field written on `owner` itself, in canonical
@@ -986,7 +1246,7 @@ impl DynamicFieldIndex {
         self.direct_field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
-            .map_or(&[], Vec::as_slice)
+            .map_or(&[], DefSites::as_slice)
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
@@ -1004,22 +1264,10 @@ impl DynamicFieldIndex {
             .is_some_and(|definitions| !definitions.is_empty())
     }
 
-    /// Every owner's assigning-file records, for whole-index snapshots.
-    pub fn iter_all_owner_fields(
-        &self,
-    ) -> impl Iterator<Item = (&DynamicFieldOwner, &HashMap<SmolStr, HashSet<FileId>>)> {
-        self.owner_fields.iter()
-    }
-
     /// Every owner's field-definition sites, for whole-index snapshots.
     pub fn iter_all_field_definitions(
         &self,
-    ) -> impl Iterator<
-        Item = (
-            &DynamicFieldOwner,
-            &HashMap<SmolStr, Vec<InFiled<TextRange>>>,
-        ),
-    > {
+    ) -> impl Iterator<Item = (&DynamicFieldOwner, &HashMap<SmolStr, DefSites>)> {
         self.field_definitions.iter()
     }
 
@@ -1029,12 +1277,7 @@ impl DynamicFieldIndex {
     /// between the direct and propagated tiers leaves the union unchanged.
     pub fn iter_all_direct_field_definitions(
         &self,
-    ) -> impl Iterator<
-        Item = (
-            &DynamicFieldOwner,
-            &HashMap<SmolStr, Vec<InFiled<TextRange>>>,
-        ),
-    > {
+    ) -> impl Iterator<Item = (&DynamicFieldOwner, &HashMap<SmolStr, DefSites>)> {
         self.direct_field_definitions.iter()
     }
 
@@ -1064,12 +1307,8 @@ impl DynamicFieldIndex {
     }
 
     /// What a read of `DynamicField(owner, Some(field_name))` observes: the
-    /// assigning files, the definitions and the direct definitions.
+    /// definitions and the direct definitions.
     fn named_slot_fingerprint(&self, owner: &DynamicFieldOwner, field_name: &str) -> Fingerprint {
-        let files = self
-            .owner_fields
-            .get(owner)
-            .and_then(|fields| fields.get(field_name));
         let definitions = self
             .field_definitions
             .get(owner)
@@ -1078,15 +1317,13 @@ impl DynamicFieldIndex {
             .direct_field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name));
-        if files.is_none() && definitions.is_none() && direct.is_none() {
+        if definitions.is_none() && direct.is_none() {
             return derivation::ABSENT;
         }
-        let files = files.map(|files| {
-            let mut files: Vec<FileId> = files.iter().copied().collect();
-            files.sort_unstable();
-            files
-        });
-        derivation::fingerprint_of(&(files, definitions, direct))
+        derivation::fingerprint_of(&(
+            definitions.map(DefSites::as_slice),
+            direct.map(DefSites::as_slice),
+        ))
     }
 
     /// Notes a named slot's change since `old_slot` and folds it into the
@@ -1115,12 +1352,6 @@ impl DynamicFieldIndex {
             .into_iter()
             .filter_map(|map| map.get(owner))
             .flat_map(|fields| fields.keys().cloned())
-            .chain(
-                self.owner_fields
-                    .get(owner)
-                    .into_iter()
-                    .flat_map(|fields| fields.keys().cloned()),
-            )
             .collect()
     }
 
@@ -1172,11 +1403,6 @@ impl DynamicFieldIndex {
                 }
             }
         }
-        changed(
-            frozen.owner_fields.get(owner),
-            fork.owner_fields.get(owner),
-            names,
-        );
         changed(
             frozen.field_definitions.get(owner),
             fork.field_definitions.get(owner),
@@ -1385,7 +1611,7 @@ impl DynamicFieldIndex {
 /// Drops `definition` from `owner`'s `field_name`. Returns whether it was
 /// there.
 fn remove_field_definition(
-    definitions: &mut CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    definitions: &mut CowShards<DynamicFieldOwner, HashMap<SmolStr, DefSites>>,
     owner: &DynamicFieldOwner,
     field_name: &str,
     definition: &InFiled<TextRange>,
@@ -1396,9 +1622,7 @@ fn remove_field_definition(
     let Some(entries) = fields.get_mut(field_name) else {
         return false;
     };
-    let before = entries.len();
-    entries.retain(|existing| existing != definition);
-    let removed = entries.len() != before;
+    let removed = entries.remove(definition);
     if entries.is_empty() {
         fields.remove(field_name);
     }
@@ -1410,7 +1634,7 @@ fn remove_field_definition(
 
 #[cfg(test)]
 fn normalize_field_definitions(
-    definitions: &CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    definitions: &CowShards<DynamicFieldOwner, HashMap<SmolStr, DefSites>>,
 ) -> HashMap<DynamicFieldOwner, HashMap<SmolStr, HashMap<InFiled<TextRange>, usize>>> {
     definitions
         .iter()
@@ -1452,9 +1676,8 @@ impl LuaIndex for DynamicFieldIndex {
     fn clear(&mut self) {
         if derivation::recording() {
             let owners: HashSet<&DynamicFieldOwner> = self
-                .owner_fields
+                .field_definitions
                 .keys()
-                .chain(self.field_definitions.keys())
                 .chain(self.direct_field_definitions.keys())
                 .chain(self.finite_named_members.keys())
                 .chain(self.wildcard_definitions.keys())
@@ -1470,7 +1693,6 @@ impl LuaIndex for DynamicFieldIndex {
             }
         }
         self.owner_named_fingerprints.clear();
-        self.owner_fields.clear();
         self.field_definitions.clear();
         self.direct_field_definitions.clear();
         self.finite_named_members.clear();
@@ -1525,13 +1747,6 @@ mod tests {
                 format!("digest {owner:?} {digest}")
             })
             .collect::<Vec<_>>();
-        state.extend(index.owner_fields.iter().flat_map(|(owner, fields)| {
-            fields.iter().map(move |(name, files)| {
-                let mut files = files.iter().copied().collect::<Vec<_>>();
-                files.sort_unstable();
-                format!("files {owner:?} {name} {files:?}")
-            })
-        }));
         state.extend(index.field_definitions.iter().flat_map(|(owner, fields)| {
             fields.iter().map(move |(name, definitions)| {
                 format!("definitions {owner:?} {name} {definitions:?}")
@@ -1721,7 +1936,11 @@ mod tests {
             index
                 .site_contributions
                 .get(&InFiled::new(bystander, range(5, 6)))
-                .map(|entries| &entries.named[0].0),
+                .and_then(|entries| match entries {
+                    SiteContributions::OneNamed(owner, _, _) => Some(owner),
+                    SiteContributions::Many(data) => data.named.first().map(|(owner, _, _)| owner),
+                    SiteContributions::Empty => None,
+                }),
             Some(&moved)
         );
     }
@@ -2030,14 +2249,12 @@ mod tests {
             range(3, 4),
         );
 
-        let expected_owner_fields = index.owner_fields.clone();
         let expected_field_definitions = index.field_definitions.clone();
         let expected_wildcard_definitions = index.wildcard_definitions.clone();
         let expected_site_contributions = index.site_contributions.clone();
 
         index.remove(missing_file);
 
-        assert_eq!(index.owner_fields, expected_owner_fields);
         assert_eq!(index.field_definitions, expected_field_definitions);
         assert_eq!(index.wildcard_definitions, expected_wildcard_definitions);
         assert_eq!(index.site_contributions, expected_site_contributions);
@@ -2117,7 +2334,6 @@ mod tests {
             range(7, 8),
         );
 
-        assert_eq!(index.owner_fields, fresh.owner_fields);
         assert_eq!(
             normalize_field_definitions(&index.field_definitions),
             normalize_field_definitions(&fresh.field_definitions)
@@ -2226,7 +2442,6 @@ mod tests {
             &[remaining_file],
         );
 
-        assert_eq!(index.owner_fields, fresh.owner_fields);
         assert_eq!(
             normalize_field_definitions(&index.field_definitions),
             normalize_field_definitions(&fresh.field_definitions)
@@ -2341,14 +2556,11 @@ mod tests {
 }
 
 crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
-    owner_fields => |current, frozen, fork| {
-        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
-    },
     field_definitions => |current, frozen, fork| {
-        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_definitions)
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_def_sites)
     },
     direct_field_definitions => |current, frozen, fork| {
-        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_definitions)
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_def_sites)
     },
     finite_named_members => crate::db_index::cow_shards::merge_set,
     wildcard_definitions => merge_definitions,
