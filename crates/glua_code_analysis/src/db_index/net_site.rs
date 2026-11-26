@@ -8,6 +8,7 @@ use rowan::TextRange;
 use rustc_hash::FxHashMap;
 
 use super::derivation::{self, DerivedFact, FactKey, Fingerprint};
+use super::stored_fact_fingerprint;
 use crate::{FileId, InFiled};
 
 /// A stored fact with its fingerprint when stored.
@@ -28,7 +29,7 @@ impl StoredNetCall {
     pub(super) fn fingerprint(&self, own: FileId) -> Fingerprint {
         match self {
             Self::TargetOnly(target) => target_only_fingerprint(own, target),
-            Self::Full(site) => site.1,
+            Self::Full(site) => stored_fact_fingerprint(site),
         }
     }
 
@@ -115,7 +116,7 @@ impl FileNetSites {
     ) -> Option<Fingerprint> {
         match kind {
             NetSiteKind::Call => self.calls.get(&range).map(|call| call.fingerprint(own)),
-            NetSiteKind::Helper => self.helpers.get(&range).map(|(_, fp)| *fp),
+            NetSiteKind::Helper => self.helpers.get(&range).map(stored_fact_fingerprint),
         }
     }
 

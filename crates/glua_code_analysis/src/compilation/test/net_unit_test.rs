@@ -254,6 +254,27 @@ WriteBoth(\"a\")
 net.Broadcast()
 ";
 
+    #[test]
+    fn shifting_a_net_helper_does_not_reevaluate_its_callers() {
+        let mut ws = gmod_workspace();
+        ws.def_files(vec![
+            (PAYLOAD, PAYLOAD_TEXT),
+            (WRAPPER, WRAPPER_TEXT),
+            (BOTH, BOTH_TEXT),
+        ]);
+        let uri = ws.virtual_url_generator.new_uri(PAYLOAD);
+        let payload_id = path_id(&ws, PAYLOAD);
+        ws.analysis
+            .update_file_text_only(&uri, format!("\n{PAYLOAD_TEXT}"))
+            .expect("staged helper shift");
+        ws.analysis.reindex_files(vec![payload_id]);
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            &[payload_id]
+        );
+    }
+
     /// A helper's composed ops name the positions of the helpers it reaches in
     /// other files: after a shift of one of those files and an edit of the
     /// caller, the caller holds the flows of a cold build.
