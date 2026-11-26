@@ -209,9 +209,9 @@ impl EditMaps {
     pub fn map_key(&self, key: &FactKey) -> Option<FactKey> {
         use FactKey as K;
         Some(match key {
-            K::TypeCache(owner) => K::TypeCache(match owner {
-                LuaTypeOwner::Decl(id) => LuaTypeOwner::Decl(self.decl_id(*id)?),
-                LuaTypeOwner::Member(id) => LuaTypeOwner::Member(self.member_id(*id)?),
+            K::TypeCache(owner) => K::type_cache(&match owner.to_owner() {
+                LuaTypeOwner::Decl(id) => LuaTypeOwner::Decl(self.decl_id(id)?),
+                LuaTypeOwner::Member(id) => LuaTypeOwner::Member(self.member_id(id)?),
                 LuaTypeOwner::SyntaxId(id) => LuaTypeOwner::SyntaxId(InFiled::new(
                     id.file_id,
                     self.syntax_id(id.file_id, id.value)?,
@@ -227,10 +227,10 @@ impl EditMaps {
             K::MemberHome(id) => K::MemberHome(self.member_id(*id)?),
             K::MemberTransfer(id) => K::MemberTransfer(self.member_id(*id)?),
             K::MemberMarks(id) => K::MemberMarks(self.member_id(*id)?),
-            K::MemberSlot(owner, key) => {
-                K::MemberSlot(self.member_owner(owner)?, self.member_key(key)?)
+            K::MemberSlot(boxed) => {
+                K::member_slot(self.member_owner(&boxed.0)?, self.member_key(&boxed.1)?)
             }
-            K::MemberKey(key) => K::MemberKey(self.member_key(key)?),
+            K::MemberKey(key) => K::member_key(self.member_key(key)?),
             K::MemberOwnerMap(owner) => K::MemberOwnerMap(self.member_owner(owner)?),
             K::MemberOwnerExprKeys(owner) => K::MemberOwnerExprKeys(self.member_owner(owner)?),
             K::MemberOwnerFields(owner) => K::MemberOwnerFields(self.member_owner(owner)?),
@@ -259,14 +259,17 @@ impl EditMaps {
             K::Contrib(id, idx) => K::Contrib(self.signature_id(*id)?, *idx),
             K::ReceiverAuthority(id) => K::ReceiverAuthority(self.signature_id(*id)?),
             K::CallbackParams(id) => K::CallbackParams(self.signature_id(*id)?),
-            K::CallRole(super::CallRoleKey::Signature(id)) => {
-                K::CallRole(super::CallRoleKey::Signature(self.signature_id(*id)?))
-            }
+            K::CallRole(boxed) => match boxed.as_ref() {
+                super::CallRoleKey::Signature(id) => {
+                    K::call_role(super::CallRoleKey::Signature(self.signature_id(*id)?))
+                }
+                _ => return None,
+            },
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
             }
             K::SpecialCallFor(file_id, var_ref_id) => {
-                K::SpecialCallFor(*file_id, self.var_ref_id(var_ref_id)?)
+                K::special_call_for(*file_id, self.var_ref_id(var_ref_id)?)
             }
             K::GmodRealmAt(file_id, offset) => {
                 K::GmodRealmAt(*file_id, self.position(*file_id, *offset)?)
@@ -280,13 +283,16 @@ impl EditMaps {
             K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => {
                 K::DynamicFieldFinite(DynamicFieldOwner::Table(self.site(site)?))
             }
-            K::DynamicField(DynamicFieldOwner::Table(site), name) => {
-                K::DynamicField(DynamicFieldOwner::Table(self.site(site)?), name.clone())
-            }
+            K::DynamicField(boxed) => match &boxed.0 {
+                DynamicFieldOwner::Table(site) => {
+                    K::dynamic_field(DynamicFieldOwner::Table(self.site(site)?), boxed.1.clone())
+                }
+                _ => return None,
+            },
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => {
                 K::OperatorOwner(LuaOperatorOwner::Table(self.site(site)?))
             }
-            K::Property(id) => K::Property(match id {
+            K::Property(id) => K::property(match id.as_ref() {
                 LuaSemanticDeclId::Member(id) => LuaSemanticDeclId::Member(self.member_id(*id)?),
                 LuaSemanticDeclId::LuaDecl(id) => LuaSemanticDeclId::LuaDecl(self.decl_id(*id)?),
                 LuaSemanticDeclId::Signature(id) => {

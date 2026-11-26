@@ -188,7 +188,7 @@ mod query_presence_tests {
 
     #[test]
     fn parallel_transport_query_slot_width_clone_and_recycle() {
-        assert_eq!(std::mem::size_of::<KeySlot>(), 120);
+        assert_eq!(std::mem::size_of::<KeySlot>(), 80);
         let mut graph = ReaderGraph::default();
         let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
             FileId::new(1),
@@ -241,12 +241,12 @@ enum Readers {
     None,
     One(Fingerprint, DerivIdx),
     /// Two or more readers.
-    Group(Fingerprint, Vec<DerivIdx>),
+    Group(Box<(Fingerprint, Vec<DerivIdx>)>),
     /// Two or more groups.
-    Groups(Vec<(Fingerprint, Vec<DerivIdx>)>),
+    Groups(Box<Vec<(Fingerprint, Vec<DerivIdx>)>>),
 }
 
-const _: () = assert!(std::mem::size_of::<Readers>() <= 32);
+const _: () = assert!(std::mem::size_of::<Readers>() == 16);
 
 impl Readers {
     /// Files `deriv` as having seen `seen`, out of the group it was in.
@@ -260,12 +260,12 @@ impl Readers {
                 } else {
                     vec![deriv, *reader]
                 };
-                *self = Self::Group(seen, pair);
+                *self = Self::Group(Box::new((seen, pair)));
             }
-            Self::Group(group, derivs) if *group == seen => {
-                if let Err(at) = derivs.binary_search(&deriv) {
-                    reserve_readers(derivs, 1);
-                    derivs.insert(at, deriv);
+            Self::Group(group) if group.0 == seen => {
+                if let Err(at) = group.1.binary_search(&deriv) {
+                    reserve_readers(&mut group.1, 1);
+                    group.1.insert(at, deriv);
                 }
             }
             Self::Groups(groups) => {
@@ -285,12 +285,13 @@ impl Readers {
                 self.collapse();
             }
             Self::One(group, reader) => {
-                *self = Self::Groups(vec![(*group, vec![*reader]), (seen, vec![deriv])]);
+                *self = Self::Groups(Box::new(vec![(*group, vec![*reader]), (seen, vec![deriv])]));
             }
-            Self::Group(group, derivs) => {
-                take_from(derivs, deriv);
-                let derivs = std::mem::take(derivs);
-                *self = Self::Groups(vec![(*group, derivs), (seen, vec![deriv])]);
+            Self::Group(group) => {
+                take_from(&mut group.1, deriv);
+                let prev_seen = group.0;
+                let derivs = std::mem::take(&mut group.1);
+                *self = Self::Groups(Box::new(vec![(prev_seen, derivs), (seen, vec![deriv])]));
                 self.collapse();
             }
         }
@@ -304,10 +305,10 @@ impl Readers {
                     *self = Self::None;
                 }
             }
-            Self::Group(seen, derivs) => {
-                take_from(derivs, deriv);
-                if let [reader] = derivs.as_slice() {
-                    *self = Self::One(*seen, *reader);
+            Self::Group(group) => {
+                take_from(&mut group.1, deriv);
+                if let [reader] = group.1.as_slice() {
+                    *self = Self::One(group.0, *reader);
                 }
             }
             Self::Groups(groups) => {
@@ -326,9 +327,9 @@ impl Readers {
                 debug_assert_eq!(*reader, deriv);
                 *seen
             }
-            Self::Group(seen, derivs) => {
-                debug_assert!(derivs.binary_search(&deriv).is_ok());
-                *seen
+            Self::Group(group) => {
+                debug_assert!(group.1.binary_search(&deriv).is_ok());
+                group.0
             }
             _ => self
                 .groups()
@@ -342,9 +343,14 @@ impl Readers {
     fn relabel(&mut self, from: Fingerprint, to: Fingerprint) {
         match self {
             Self::None => {}
-            Self::One(seen, _) | Self::Group(seen, _) => {
+            Self::One(seen, _) => {
                 if *seen == from {
                     *seen = to;
+                }
+            }
+            Self::Group(group) => {
+                if group.0 == from {
+                    group.0 = to;
                 }
             }
             Self::Groups(groups) => {
@@ -363,6 +369,21 @@ impl Readers {
                     None => groups.push((to, derivs)),
                 }
                 self.collapse();
+            }
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::None | Self::One(..) => {}
+            Self::Group(group) => {
+                group.1.shrink_to_fit();
+            }
+            Self::Groups(groups) => {
+                for (_, derivs) in groups.iter_mut() {
+                    derivs.shrink_to_fit();
+                }
+                groups.shrink_to_fit();
             }
         }
     }
@@ -431,8 +452,8 @@ impl Readers {
         let mut groups = match std::mem::take(self) {
             Self::None => Vec::new(),
             Self::One(seen, reader) => vec![(seen, vec![reader])],
-            Self::Group(seen, derivs) => vec![(seen, derivs)],
-            Self::Groups(groups) => groups,
+            Self::Group(group) => vec![*group],
+            Self::Groups(groups) => *groups,
         };
         let of = |moved: &[(Fingerprint, DerivIdx)], seen: Fingerprint| {
             let start = moved.partition_point(|(group, _)| *group < seen);
@@ -456,7 +477,7 @@ impl Readers {
                 (seen, derivs)
             })
             .collect::<Vec<_>>();
-        *self = Self::Groups(regrouped);
+        *self = Self::Groups(Box::new(regrouped));
         self.collapse();
     }
 
@@ -476,8 +497,8 @@ impl Readers {
         let (single, many) = match self {
             Self::None => (None, &[][..]),
             Self::One(seen, reader) => (Some((*seen, std::slice::from_ref(reader))), &[][..]),
-            Self::Group(seen, derivs) => (Some((*seen, derivs.as_slice())), &[][..]),
-            Self::Groups(groups) => (None, &groups[..]),
+            Self::Group(group) => (Some((group.0, group.1.as_slice())), &[][..]),
+            Self::Groups(groups) => (None, groups.as_slice()),
         };
         single
             .into_iter()
@@ -494,9 +515,13 @@ impl Readers {
         let list = |derivs: &Vec<DerivIdx>| derivs.capacity() * std::mem::size_of::<DerivIdx>();
         match self {
             Self::None | Self::One(..) => (0, 0),
-            Self::Group(_, derivs) => (0, list(derivs)),
+            Self::Group(group) => (
+                std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
+                list(&group.1),
+            ),
             Self::Groups(groups) => (
-                groups.capacity() * std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
+                std::mem::size_of::<Vec<(Fingerprint, Vec<DerivIdx>)>>()
+                    + groups.capacity() * std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
                 groups.iter().map(|(_, derivs)| list(derivs)).sum(),
             ),
         }
@@ -515,7 +540,7 @@ impl Readers {
             None => Self::None,
             Some((seen, derivs)) => match derivs.as_slice() {
                 [reader] => Self::One(seen, *reader),
-                _ => Self::Group(seen, derivs),
+                _ => Self::Group(Box::new((seen, derivs))),
             },
         };
     }
@@ -1282,6 +1307,20 @@ pub struct ReaderGraph {
 impl ReaderGraph {
     pub(crate) fn quarantine_releases(&mut self) -> super::ReleaseQuarantine {
         self.table.quarantine_releases()
+    }
+
+    /// Trims spare capacity in reader lists after a bulk build so `reserve_readers`'s
+    /// growth headroom is not retained across millions of settled keys.
+    pub fn shrink_reader_sets(&mut self) {
+        use rayon::prelude::*;
+        if self.table.keys.len() < 10_000 {
+            return;
+        }
+        self.table.keys.pages_mut().par_iter_mut().for_each(|page| {
+            for slot in page.iter_mut() {
+                slot.readers.shrink_to_fit();
+            }
+        });
     }
 
     /// Counts and estimated heap sizes of the graph's parts, for the profile.

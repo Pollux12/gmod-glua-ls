@@ -446,11 +446,11 @@ pub struct GmodNetworkIndex {
 }
 
 fn note_sends_write(name: &str) {
-    derivation::note_write(|| FactKey::NetSends(SmolStr::new(name)));
+    derivation::note_write(|| FactKey::NetSends(name.into()));
 }
 
 fn note_receives_write(name: &str) {
-    derivation::note_write(|| FactKey::NetReceives(SmolStr::new(name)));
+    derivation::note_write(|| FactKey::NetReceives(name.into()));
 }
 
 /// The fingerprint of the flows `indexed` names, each hashed as its file's
@@ -642,7 +642,7 @@ impl GmodNetworkIndex {
                 derivation::fingerprint_of(&names)
             }
             FactKey::NetHelperName(name) => {
-                if self.helper_names.contains(name) {
+                if self.helper_names.contains(name.as_str()) {
                     derivation::fingerprint_of(name)
                 } else {
                     derivation::ABSENT
@@ -715,7 +715,7 @@ impl GmodNetworkIndex {
     pub(crate) fn set_helper_names(&mut self, names: FxHashSet<SmolStr>) {
         if derivation::recording() {
             for name in names.symmetric_difference(&self.helper_names) {
-                derivation::note_write(|| FactKey::NetHelperName(name.clone()));
+                derivation::note_write(|| FactKey::NetHelperName(name.as_str().into()));
             }
         }
         self.helper_names = Arc::new(names);
@@ -723,7 +723,7 @@ impl GmodNetworkIndex {
 
     /// Whether `name` is a net-helper name, read as that name.
     pub(crate) fn is_helper_name(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::NetHelperName(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::NetHelperName(name.into()));
         self.helper_names.contains(name)
     }
 
@@ -873,7 +873,7 @@ impl GmodNetworkIndex {
 
     /// Notes a read of the flows sent under `name`.
     pub(crate) fn note_sends_read(name: &str) {
-        derivation::note_read(|| FactKey::NetSends(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::NetSends(name.into()));
     }
 
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {
@@ -907,7 +907,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_receive_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetReceiveFlow)> {
-        derivation::note_read(|| FactKey::NetReceives(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::NetReceives(name.into()));
         let mut flows: Vec<_> = self
             .receive_flows_by_message
             .get(name)
@@ -1019,7 +1019,7 @@ impl GmodNetworkIndex {
         self.canonical_ops.clear();
         if derivation::recording() {
             for name in self.helper_names.iter() {
-                derivation::note_write(|| FactKey::NetHelperName(name.clone()));
+                derivation::note_write(|| FactKey::NetHelperName(name.as_str().into()));
             }
         }
         self.helper_names = Arc::default();
@@ -1341,8 +1341,8 @@ mod tests {
             .iter()
             .flat_map(|name| {
                 [
-                    index.fact_fingerprint(&FactKey::NetSends(SmolStr::new(name))),
-                    index.fact_fingerprint(&FactKey::NetReceives(SmolStr::new(name))),
+                    index.fact_fingerprint(&FactKey::NetSends((*name).into())),
+                    index.fact_fingerprint(&FactKey::NetReceives((*name).into())),
                 ]
             })
             .collect::<Vec<_>>();

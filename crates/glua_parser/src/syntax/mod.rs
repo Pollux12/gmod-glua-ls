@@ -387,6 +387,10 @@ impl LuaSyntaxId {
         self.kind.into()
     }
 
+    pub fn raw_kind(&self) -> LuaKind {
+        self.kind
+    }
+
     pub fn get_token_kind(&self) -> LuaTokenKind {
         self.kind.into()
     }

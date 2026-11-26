@@ -9,7 +9,6 @@ pub(crate) use global_id::clear_global_id_intern_cache;
 
 use crate::FileId;
 use crate::db_index::derivation::{self, FactKey, Fingerprint};
-use smol_str::SmolStr;
 
 use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 
@@ -33,7 +32,7 @@ fn scan_element(
 }
 
 fn note_global_write(name: &str) {
-    derivation::note_write(|| FactKey::Global(SmolStr::new(name)));
+    derivation::note_write(|| FactKey::Global(name.into()));
     derivation::note_write(|| FactKey::GlobalScan);
 }
 
@@ -211,7 +210,7 @@ impl LuaGlobalIndex {
     pub fn get_global_decl_ids(&self, name: &str) -> Option<&Vec<LuaDeclId>> {
         // Borrowed lookup: `GlobalId` hashes by name and borrows as `str`,
         // so this finds the same bucket without interning a new id per call.
-        derivation::note_read(|| FactKey::Global(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::Global(name.into()));
         self.global_decl.get(name)
     }
 
@@ -259,7 +258,7 @@ impl LuaGlobalIndex {
     }
 
     pub fn is_exist_global_decl(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::Global(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::Global(name.into()));
         self.global_decl.contains_key(name)
     }
 

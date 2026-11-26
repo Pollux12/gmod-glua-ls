@@ -2778,7 +2778,7 @@ mod tests {
                     .map(|decl| decl.get_id())
             })
             .expect("the local");
-        let slot = FactKey::TypeCache(crate::LuaTypeOwner::Decl(decl_id));
+        let slot = FactKey::type_cache(&crate::LuaTypeOwner::Decl(decl_id));
         let producing = root
             .descendants::<glua_parser::LuaAssignStat>()
             .map(|assign| {

@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     fn member_slot() -> FactKey {
-        FactKey::MemberSlot(
+        FactKey::member_slot(
             crate::LuaMemberOwner::GlobalPath(crate::GlobalId::new("resume_test")),
             crate::LuaMemberKey::Name("field".into()),
         )
@@ -1757,9 +1757,10 @@ mod tests {
                 ),
                 holds_after_write_of_a_read_made_before_resuming(
                     || {
-                        let FactKey::MemberSlot(owner, key) = member_slot() else {
+                        let FactKey::MemberSlot(boxed) = member_slot() else {
                             unreachable!("a member slot");
                         };
+                        let (owner, key) = *boxed;
                         derivation::note_member_slot_read(&owner, &key);
                     },
                     member_slot

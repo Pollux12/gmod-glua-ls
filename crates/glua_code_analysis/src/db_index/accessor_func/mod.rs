@@ -126,7 +126,7 @@ impl AccessorFuncAnnotationIndex {
         annotation: AccessorFuncAnnotation,
         file_order_key: Arc<str>,
     ) {
-        derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+        derivation::note_write(|| FactKey::AccessorFunc(name.as_str().into()));
         let file_id = annotation.file_id;
         self.file_order.entry(file_id).or_insert(file_order_key);
         let file_order = &self.file_order;
@@ -162,7 +162,7 @@ impl AccessorFuncAnnotationIndex {
                             .cmp(&annotation_sort_key(file_order, right))
                     });
                 }
-                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+                derivation::note_write(|| FactKey::AccessorFunc(name.as_str().into()));
             }
         }
     }
@@ -192,33 +192,35 @@ impl AccessorFuncAnnotationIndex {
     }
 
     pub fn contains_name(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::AccessorFunc(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::AccessorFunc(name.into()));
         self.by_name.contains_key(name)
     }
 
     pub fn get_annotations(&self, name: &str) -> Option<&Vec<AccessorFuncAnnotation>> {
-        derivation::note_read(|| FactKey::AccessorFunc(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::AccessorFunc(name.into()));
         self.by_name.get(name)
     }
     pub fn annotation_entries(
         &self,
     ) -> impl Iterator<Item = (&SmolStr, &Vec<AccessorFuncAnnotation>)> {
         self.by_name.iter().inspect(|(name, _)| {
-            derivation::note_read(|| FactKey::AccessorFunc((*name).clone()));
+            derivation::note_read(|| FactKey::AccessorFunc((*name).as_str().into()));
         })
     }
 
     pub fn annotation_files(&self) -> impl Iterator<Item = (&FileId, &Vec<SmolStr>)> {
         self.by_file.iter().inspect(|(_, names)| {
             for name in names.iter() {
-                derivation::note_read(|| FactKey::AccessorFunc(name.clone()));
+                derivation::note_read(|| FactKey::AccessorFunc(name.as_str().into()));
             }
         })
     }
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
-            FactKey::AccessorFunc(name) => derivation::fingerprint_opt(self.by_name.get(name)),
+            FactKey::AccessorFunc(name) => {
+                derivation::fingerprint_opt(self.by_name.get(name.as_str()))
+            }
             _ => {
                 debug_assert!(false, "{key:?} is not an accessor-func annotation fact");
                 derivation::ABSENT
@@ -247,7 +249,7 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
         self.file_order.remove(&file_id);
         if let Some(names) = self.by_file.remove(&file_id) {
             for name in names {
-                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+                derivation::note_write(|| FactKey::AccessorFunc(name.as_str().into()));
                 if let Some(annotations) = self.by_name.get_mut(&name) {
                     annotations.retain(|annotation| annotation.file_id != file_id);
                     if annotations.is_empty() {
@@ -261,7 +263,7 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
     fn clear(&mut self) {
         if derivation::recording() {
             for name in self.by_name.keys() {
-                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+                derivation::note_write(|| FactKey::AccessorFunc(name.as_str().into()));
             }
         }
         self.by_name.clear();

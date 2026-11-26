@@ -1498,7 +1498,7 @@ struct StatementType {
 
 /// The fact holding the type `owner`'s statements wrote.
 fn statement_fact(owner: &LuaTypeOwner) -> crate::LostFact {
-    crate::LostFact::new(owner.get_file_id(), FactKey::TypeCache(owner.clone()))
+    crate::LostFact::new(owner.get_file_id(), FactKey::type_cache(owner))
 }
 
 /// Notes a write of `owner`'s stored type. A file's local fallbacks move it
@@ -1507,10 +1507,10 @@ fn statement_fact(owner: &LuaTypeOwner) -> crate::LostFact {
 fn note_type_written(owner: &LuaTypeOwner) {
     let file_id = owner.get_file_id();
     if derivation::writes_fallback_of(file_id) {
-        derivation::rehoming(|| derivation::note_write(|| FactKey::TypeCache(owner.clone())));
+        derivation::rehoming(|| derivation::note_write(|| FactKey::type_cache(owner)));
         derivation::note_write(|| FactKey::TypeFallbacks(file_id));
     } else {
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
     }
 }
 
@@ -2759,7 +2759,7 @@ impl LuaTypeIndex {
         let stored = self.types.get(owner);
         if let Some(stored) = stored {
             if !stored.read.note(
-                || FactKey::TypeCache(owner.clone()),
+                || FactKey::type_cache(owner),
                 |key| matches!(key, FactKey::TypeCache(stored) if stored == owner),
             ) {
                 derivation::note_type_cache_read(owner);
@@ -2769,7 +2769,7 @@ impl LuaTypeIndex {
         }
         match self.statement_type(owner).filter(|_| {
             stored.map_or_else(
-                || derivation::recomputes(FactKey::TypeCache(owner.clone())),
+                || derivation::recomputes(FactKey::type_cache(owner)),
                 |stored| stored.read.recomputes(owner),
             )
         }) {
@@ -2812,7 +2812,7 @@ impl LuaTypeIndex {
             return true;
         };
         self.set_statement_type(owner, written);
-        if !derivation::recomputes(FactKey::TypeCache(owner.clone())) {
+        if !derivation::recomputes(FactKey::type_cache(owner)) {
             derivation::rerun_current();
         }
         true
@@ -2864,7 +2864,7 @@ impl LuaTypeIndex {
         if metadata_moved {
             self.refresh_fact_refs(owner);
         }
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
     }
 
     /// Drops the types `file_id`'s local fallbacks published, restoring what
@@ -3011,7 +3011,7 @@ impl LuaTypeIndex {
         owner: &LuaTypeOwner,
         value: Option<(LuaTypeCache, Option<LuaTypeFactMetadata>)>,
     ) {
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
         match value {
             Some((cache, metadata)) => {
                 self.insert_type_cache(owner.clone(), cache);
@@ -3291,7 +3291,7 @@ impl LuaTypeIndex {
         let mut removed = Vec::new();
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+            derivation::note_write(|| FactKey::type_cache(&owner));
             if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
                 set.remove(&owner);
             }
@@ -3469,7 +3469,7 @@ impl LuaTypeIndex {
         // Ordered by a real key rather than hash-map iteration order.
         metadata_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (owner, metadata) in metadata_updates {
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+            derivation::note_write(|| FactKey::type_cache(&owner));
             self.fact_metadata.insert(owner, metadata);
         }
 
@@ -3644,13 +3644,14 @@ impl LuaTypeIndex {
         }
         match key {
             FactKey::TypeCache(owner) => {
-                let Some(cache) = self.types.get(owner) else {
+                let owner = owner.to_owner();
+                let Some(cache) = self.types.get(&owner) else {
                     return derivation::ABSENT;
                 };
-                let metadata = self.fact_metadata.get(owner);
+                let metadata = self.fact_metadata.get(&owner);
                 // What the statements left under a fallback moves the key
                 // too: the fallback was guessed from it.
-                match self.statement_type(owner).filter(|statement| {
+                match self.statement_type(&owner).filter(|statement| {
                     statement.cache.as_ref() != Some(&cache.cache)
                         || statement.metadata.as_ref() != metadata
                 }) {
@@ -4222,7 +4223,7 @@ impl LuaTypeIndex {
         }
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
-                derivation::note_write(|| FactKey::TypeCache(type_owner.clone()));
+                derivation::note_write(|| FactKey::type_cache(&type_owner));
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     if self.decl_write_claims.remove(decl_id).is_some() {
                         derivation::note_write(|| FactKey::DeclClaim(*decl_id));
@@ -4274,7 +4275,7 @@ impl LuaTypeIndex {
             }
         }
         for owner in self.types.keys() {
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+            derivation::note_write(|| FactKey::type_cache(owner));
         }
         for file_id in self.fallbacks.keys() {
             derivation::note_write(|| FactKey::TypeFallbacks(*file_id));

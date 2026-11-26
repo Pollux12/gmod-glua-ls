@@ -294,7 +294,7 @@ impl LuaFlowIndex {
     /// Whether a special-call effect of `file_id` narrows `var_ref_id`: the
     /// flow walk's special calls change nothing else about it.
     pub fn has_special_call_effect_for(&self, file_id: &FileId, var_ref_id: &VarRefId) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, var_ref_id.clone()));
+        derivation::note_read(|| FactKey::special_call_for(*file_id, var_ref_id.clone()));
         self.effects_in(file_id)
             .any(|(_, effect)| effect.narrows(var_ref_id))
     }
@@ -305,7 +305,7 @@ impl LuaFlowIndex {
         position: TextSize,
         target: &VarRefId,
     ) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, target.clone()));
+        derivation::note_read(|| FactKey::special_call_for(*file_id, target.clone()));
         self.effects_in(file_id).any(|(effect_position, effect)| {
             *effect_position < position && &effect.target == target
         })
@@ -812,7 +812,7 @@ mod tests {
             )
         };
         let mut index = LuaFlowIndex::new();
-        let key = FactKey::SpecialCallFor(file_id, field(0));
+        let key = FactKey::special_call_for(file_id, field(0));
         let seen = derivation::in_file(Some(file_id), || index.fact_fingerprint(&key));
         assert_eq!(seen, derivation::ABSENT);
 
@@ -853,9 +853,9 @@ mod tests {
             file_id,
             crate::PositionMap::new(text, &format!("\n{text}")),
         )]);
-        let key = FactKey::SpecialCallFor(file_id, target(4));
+        let key = FactKey::special_call_for(file_id, target(4));
         let moved = edits.map_key(&key).expect("the shift loses no position");
-        assert_eq!(moved, FactKey::SpecialCallFor(file_id, target(5)));
+        assert_eq!(moved, FactKey::special_call_for(file_id, target(5)));
 
         let seen = derivation::in_file(Some(file_id), || before.fact_fingerprint(&key));
         let held = derivation::fingerprint_before_edits(&edits, || {

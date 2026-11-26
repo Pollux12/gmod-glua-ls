@@ -663,6 +663,7 @@ impl Reanalysis {
     pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
         self.wrap_up(db);
         self.check_stale(db);
+        db.reader_graph_mut().shrink_reader_sets();
         Reanalysed {
             stale_diagnostics: self.stale.take().unwrap_or_default(),
             evaluated_files: self.engine.evaluated_files(),

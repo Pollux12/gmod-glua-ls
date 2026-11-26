@@ -364,7 +364,7 @@ impl LuaSignatureIndex {
     /// Records that `file_id`'s docs mark a definition named `name` as a
     /// valid guard.
     pub(crate) fn add_valid_guard_name(&mut self, file_id: FileId, name: SmolStr) {
-        derivation::note_write(|| FactKey::ValidGuardName(name.clone()));
+        derivation::note_write(|| FactKey::ValidGuardName(name.as_str().into()));
         *self
             .valid_guard_name_counts
             .entry(name.clone())
@@ -377,7 +377,7 @@ impl LuaSignatureIndex {
 
     fn remove_valid_guard_names(&mut self, file_id: FileId) {
         for name in self.valid_guard_names.remove(&file_id).unwrap_or_default() {
-            derivation::note_write(|| FactKey::ValidGuardName(name.clone()));
+            derivation::note_write(|| FactKey::ValidGuardName(name.as_str().into()));
             let Some(count) = self.valid_guard_name_counts.get_mut(&name) else {
                 continue;
             };
@@ -390,7 +390,7 @@ impl LuaSignatureIndex {
 
     /// Whether some definition named `name` is marked a valid guard.
     pub(crate) fn is_valid_guard_name(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::ValidGuardName(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::ValidGuardName(name.into()));
         self.valid_guard_name_counts.contains_key(name)
     }
 
@@ -800,7 +800,7 @@ impl LuaSignatureIndex {
             }
             FactKey::ValidGuardFiles => self.valid_guard_files.get(),
             FactKey::ValidGuardName(name) => {
-                if self.valid_guard_name_counts.contains_key(name) {
+                if self.valid_guard_name_counts.contains_key(name.as_str()) {
                     derivation::fingerprint_of(name)
                 } else {
                     derivation::ABSENT

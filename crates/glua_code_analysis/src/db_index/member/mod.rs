@@ -152,7 +152,7 @@ fn member_object(member: &LuaMember) -> impl std::hash::Hash + '_ {
 }
 
 fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
-    derivation::note_write(|| FactKey::MemberSlot(owner.clone(), key.clone()));
+    derivation::note_write(|| FactKey::member_slot(owner.clone(), key.clone()));
 }
 
 /// Notes a change to `owner`'s members. Whether it has a member map at all
@@ -418,7 +418,7 @@ impl LuaMemberIndex {
                 }
                 fingerprint_of(&(provenance, flags, scope))
             }
-            FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
+            FactKey::MemberSlot(boxed) => self.slot_fingerprint(&boxed.0, &boxed.1),
             FactKey::FunctionScope(site) => fingerprint_of(&crate::InFiled::new(
                 site.file_id,
                 self.innermost_function_scope(site.file_id, site.value),
@@ -450,14 +450,18 @@ impl LuaMemberIndex {
             }
             FactKey::MemberKey(key) if derivation::mapping_back() => self
                 .current_members_by_key
-                .get(key)
+                .get(key.as_ref())
                 .map_or(ABSENT, |members| {
                     members
                         .iter()
                         .map(fingerprint_of)
                         .fold(ABSENT, Fingerprint::wrapping_add)
                 }),
-            FactKey::MemberKey(key) => self.key_fingerprints.get(key).copied().unwrap_or(ABSENT),
+            FactKey::MemberKey(key) => self
+                .key_fingerprints
+                .get(key.as_ref())
+                .copied()
+                .unwrap_or(ABSENT),
             FactKey::MemberFile(file_id) if derivation::mapping_back() => {
                 self.recomputed_file_fingerprint(*file_id)
             }
@@ -594,7 +598,7 @@ impl LuaMemberIndex {
         derivation::note_write(|| FactKey::MemberHome(id));
         let key = self.members.get(&id).map(LuaMember::get_key);
         if let Some(key) = key {
-            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            derivation::note_write(|| FactKey::member_key(key.clone()));
         }
         if let Some(owner) = self.member_current_owner.get(&id) {
             note_owner_map_write(owner);
@@ -861,7 +865,7 @@ impl LuaMemberIndex {
             note_owner_map_write(owner);
         }
         for key in self.current_members_by_key.keys() {
-            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            derivation::note_write(|| FactKey::member_key(key.clone()));
         }
         for file_id in self.file_fingerprints.keys() {
             derivation::note_write(|| FactKey::MemberFile(*file_id));
@@ -3012,7 +3016,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
-        derivation::note_read(|| FactKey::MemberKey(key.clone()));
+        derivation::note_read(|| FactKey::member_key(key.clone()));
         let Some(member_ids) = self.current_members_by_key.get(key) else {
             return Vec::new();
         };
@@ -3042,7 +3046,7 @@ impl LuaMemberIndex {
             .or_default()
             .insert_sorted(member_id)
         {
-            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            derivation::note_write(|| FactKey::member_key(key.clone()));
             fold_fingerprint(
                 &mut self.key_fingerprints,
                 key.clone(),
@@ -3078,7 +3082,7 @@ impl LuaMemberIndex {
             removed
         };
         if removed {
-            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            derivation::note_write(|| FactKey::member_key(key.clone()));
             fold_fingerprint(
                 &mut self.key_fingerprints,
                 key.clone(),

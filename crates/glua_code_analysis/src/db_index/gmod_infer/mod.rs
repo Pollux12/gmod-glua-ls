@@ -6,7 +6,6 @@ use std::sync::{Arc, OnceLock};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
-use smol_str::SmolStr;
 
 use super::{GmodLoadIndex, GmodLoadStatus, GmodStateMask, LuaIndex};
 use crate::{
@@ -270,7 +269,7 @@ pub struct GmodSystemRegistration {
 
 /// Records a read of the registrations of `kind` under `name`.
 fn note_system_read(kind: GmodSystemRegistrationKind, name: &str) {
-    derivation::note_read(|| FactKey::GmodSystem(kind, SmolStr::new(name)));
+    derivation::note_read(|| FactKey::GmodSystem(kind, name.into()));
 }
 
 /// Records writes of the registrations `metadata` makes.
@@ -293,7 +292,7 @@ fn note_system_writes(metadata: &GmodSystemFileMetadata) {
         }));
     for (kind, name) in names {
         if let Some(name) = normalize_system_name(name) {
-            derivation::note_write(|| FactKey::GmodSystem(kind, SmolStr::new(name)));
+            derivation::note_write(|| FactKey::GmodSystem(kind, name.into()));
         }
     }
 }

@@ -4114,7 +4114,7 @@ pub(crate) struct EngineStats {
 }
 
 fn variant_name(key: &FactKey) -> String {
-    if let FactKey::DynamicField(_, None) = key {
+    if matches!(key, FactKey::DynamicField(boxed) if boxed.1.is_none()) {
         return "DynamicField(wildcard)".to_string();
     }
     let name = format!("{key:?}");
@@ -5628,7 +5628,7 @@ mod tests {
         ws.def_files(inventory_files(&shops));
         parallel::set_analysis_threads(0);
         drop(threads);
-        let read = FactKey::DynamicField(
+        let read = FactKey::dynamic_field(
             crate::DynamicFieldOwner::GlobalPath(crate::GlobalId::new("print")),
             Some("print".into()),
         );
@@ -6354,8 +6354,8 @@ print(tuned{index})"
         bind(db, 110, LuaType::IntegerConst(2));
         bind(db, 120, LuaType::IntegerConst(2));
         let inputs = [
-            HashedKey::new(FactKey::TypeCache(owner(110))),
-            HashedKey::new(FactKey::TypeCache(owner(120))),
+            HashedKey::new(FactKey::type_cache(&owner(110))),
+            HashedKey::new(FactKey::type_cache(&owner(120))),
         ];
         for input in &inputs {
             db.reader_graph().forget_fingerprint(input);
@@ -6499,7 +6499,7 @@ print(tuned{index})"
     fn a_query_filed_with_an_evaluation_keeps_the_keys_the_evaluation_read() {
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
-        let read = HashedKey::new(FactKey::TypeCache(owner(WRITTEN)));
+        let read = HashedKey::new(FactKey::type_cache(&owner(WRITTEN)));
         let query = DerivationId::new(
             DerivationKind::ReceiverAuthority,
             FileId::new(FILE),
@@ -6581,7 +6581,7 @@ function holder.receiver:Use() end
         db.get_member_index_mut()
             .rekey_member(member, crate::LuaMemberKey::Name("renamed".into()))
             .unwrap();
-        let slot = HashedKey::new(FactKey::MemberSlot(owner.clone(), key));
+        let slot = HashedKey::new(FactKey::member_slot(owner.clone(), key));
         let map = HashedKey::new(FactKey::MemberOwnerMap(owner));
         db.reader_graph().forget_fingerprint(&slot);
         db.reader_graph().forget_fingerprint(&map);
@@ -6875,7 +6875,7 @@ function holder.receiver:Use() end
         let settled = engine.stats.supersteps;
         let source = relay_owner(files[0], RELAY);
         bind_relay(db, source.clone(), LuaType::String);
-        let moved = HashedKey::new(FactKey::TypeCache(source));
+        let moved = HashedKey::new(FactKey::type_cache(&source));
         db.reader_graph().forget_fingerprint(&moved);
         engine.readers_of(db, [&moved]);
         engine.changed(relay_statement(files[2], RELAY_PAIRED));
@@ -7293,7 +7293,7 @@ function holder.receiver:Use() end
     /// `engine` check them.
     fn move_input(db: &mut DbIndex, engine: &mut Engine, value: &str) {
         bind(db, INPUT, text(value));
-        let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+        let input = HashedKey::new(FactKey::type_cache(&owner(INPUT)));
         db.reader_graph().forget_fingerprint(&input);
         engine.readers_of(db, [&input]);
     }
@@ -7640,7 +7640,7 @@ function holder.receiver:Use() end
                 let db = warm.get_db_mut();
                 let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
                 bind(db, INPUT, LuaType::Unknown);
-                let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+                let input = HashedKey::new(FactKey::type_cache(&owner(INPUT)));
                 db.reader_graph().forget_fingerprint(&input);
                 engine.readers_of(db, [&input]);
                 engine.open(db);

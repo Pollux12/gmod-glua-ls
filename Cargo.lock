@@ -187,6 +187,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "benchmark"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "chrono",
  "dhat",
  "emmy_lsp_types",
@@ -972,6 +973,7 @@ dependencies = [
 name = "glua_ls"
 version = "0.1.5"
 dependencies = [
+ "backtrace",
  "chrono",
  "clap",
  "crossbeam-channel",

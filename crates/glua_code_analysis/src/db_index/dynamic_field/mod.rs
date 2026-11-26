@@ -294,7 +294,7 @@ impl DynamicFieldIndex {
                 .or_default();
             *held += 1;
             if *held == 1 {
-                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.as_str().into()));
             }
         }
         let is_new_definition =
@@ -384,7 +384,7 @@ impl DynamicFieldIndex {
         owner: DynamicFieldOwner,
         field_name: Option<SmolStr>,
     ) {
-        derivation::note_write(|| FactKey::DynamicField(owner, field_name));
+        derivation::note_write(|| FactKey::dynamic_field(owner, field_name.map(Into::into)));
     }
 
     /// Returns whether the unattributed record was new to the index.
@@ -405,7 +405,7 @@ impl DynamicFieldIndex {
             .or_default()
             .insert(InFiled::new(site.file_id, range));
         if is_new {
-            derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
+            derivation::note_write(|| FactKey::UnattributedField(field_name.as_str().into()));
             let unattributed = &mut self.site_record(site).unattributed;
             reserve_first(unattributed);
             unattributed.push((field_name, range));
@@ -444,7 +444,7 @@ impl DynamicFieldIndex {
             }
         }
         for (field_name, range) in contributions.unattributed {
-            derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
+            derivation::note_write(|| FactKey::UnattributedField(field_name.as_str().into()));
             let definition = InFiled::new(file_id, range);
             if let Some(sites) = self.unattributed_fields.get_mut(field_name.as_str()) {
                 sites.remove(&definition);
@@ -483,7 +483,7 @@ impl DynamicFieldIndex {
             *held -= 1;
             if *held == 0 {
                 types.remove(type_id);
-                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.as_str().into()));
             }
             if types.is_empty() {
                 self.declaring_types.remove(field_name.as_str());
@@ -1096,8 +1096,8 @@ impl DynamicFieldIndex {
         if new_slot == old_slot {
             return;
         }
-        derivation::note_write(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
-        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_write(|| FactKey::dynamic_field(owner.clone(), Some(field_name.into())));
+        derivation::note_write(|| FactKey::dynamic_field(owner.clone(), None));
         let digest = self
             .owner_named_fingerprints
             .entry(owner.clone())
@@ -1129,11 +1129,13 @@ impl DynamicFieldIndex {
         if !derivation::recording() {
             return;
         }
-        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_write(|| FactKey::dynamic_field(owner.clone(), None));
         derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
         derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
         for field_name in self.owner_field_names(owner) {
-            derivation::note_write(|| FactKey::DynamicField(owner.clone(), Some(field_name)));
+            derivation::note_write(|| {
+                FactKey::dynamic_field(owner.clone(), Some(field_name.into()))
+            });
         }
     }
 
@@ -1326,17 +1328,17 @@ impl DynamicFieldIndex {
             FactKey::DynamicFieldSite(site) => {
                 derivation::fingerprint_opt(self.site_contributions.get(site))
             }
-            FactKey::DynamicField(owner, Some(field_name)) => {
-                self.named_slot_fingerprint(owner, field_name)
-            }
-            FactKey::DynamicField(owner, None) => {
-                let named = if derivation::mapping_back() {
-                    Some(self.owner_named_digest(owner)).filter(|digest| *digest != 0)
-                } else {
-                    self.owner_named_fingerprints.get(owner).copied()
-                };
-                derivation::fingerprint_opt(named.as_ref())
-            }
+            FactKey::DynamicField(boxed) => match (&boxed.0, boxed.1.as_deref()) {
+                (owner, Some(field_name)) => self.named_slot_fingerprint(owner, field_name),
+                (owner, None) => {
+                    let named = if derivation::mapping_back() {
+                        Some(self.owner_named_digest(owner)).filter(|digest| *digest != 0)
+                    } else {
+                        self.owner_named_fingerprints.get(owner).copied()
+                    };
+                    derivation::fingerprint_opt(named.as_ref())
+                }
+            },
             FactKey::DynamicFieldWildcards(owner) => {
                 derivation::fingerprint_opt(self.wildcard_definitions.get(owner))
             }
@@ -1352,20 +1354,19 @@ impl DynamicFieldIndex {
                         )
                     })
             }
-            FactKey::DynamicFieldName(field_name) => {
-                self.declaring_types
-                    .get(field_name)
-                    .map_or(derivation::ABSENT, |types| {
-                        derivation::fingerprint_of(
-                            &types
-                                .keys()
-                                .map(derivation::fingerprint_of)
-                                .fold(0u64, u64::wrapping_add),
-                        )
-                    })
-            }
+            FactKey::DynamicFieldName(field_name) => self
+                .declaring_types
+                .get(field_name.as_str())
+                .map_or(derivation::ABSENT, |types| {
+                    derivation::fingerprint_of(
+                        &types
+                            .keys()
+                            .map(derivation::fingerprint_of)
+                            .fold(0u64, u64::wrapping_add),
+                    )
+                }),
             FactKey::UnattributedField(field_name) => {
-                if self.unattributed_fields.contains_key(field_name) {
+                if self.unattributed_fields.contains_key(field_name.as_str()) {
                     derivation::fingerprint_of(&true)
                 } else {
                     derivation::ABSENT
@@ -1462,10 +1463,10 @@ impl LuaIndex for DynamicFieldIndex {
                 self.note_whole_owner_write(owner);
             }
             for field_name in self.unattributed_fields.keys() {
-                derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
+                derivation::note_write(|| FactKey::UnattributedField(field_name.as_str().into()));
             }
             for field_name in self.declaring_types.keys() {
-                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.as_str().into()));
             }
         }
         self.owner_named_fingerprints.clear();

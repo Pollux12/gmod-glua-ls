@@ -1144,7 +1144,7 @@ mod tests {
     fn parallel_transport_worker_hints_stay_global_and_local_proofs_remap_once() {
         use std::sync::atomic::Ordering;
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(4), TextSize::new(8)));
-        let fact = HashedKey::new(FactKey::TypeCache(owner));
+        let fact = HashedKey::new(FactKey::type_cache(&owner));
         let mut graph = ReaderGraph::default();
         graph.intern_read(key(99));
         let global = graph.intern_read(fact.clone());
@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn parallel_transport_worker_getter_window_and_equal_value_flags_are_validated() {
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), TextSize::new(8)));
-        let fact = HashedKey::new(FactKey::TypeCache(owner.clone()));
+        let fact = HashedKey::new(FactKey::type_cache(&owner));
         let mut graph = ReaderGraph::default();
         graph.intern_read(fact.clone());
         let mut table = graph.lend_keys();
@@ -1421,7 +1421,7 @@ mod tests {
         use crate::{LuaMemberKey, LuaMemberOwner};
         let (snapshot, guard) = snapshot(ReaderGraph::default());
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), TextSize::new(8)));
-        let fact = FactKey::TypeCache(owner);
+        let fact = FactKey::type_cache(&owner);
         let handle = FactRead::default();
         handle.0.store(123, Ordering::Relaxed);
         let result = compute_recorded(

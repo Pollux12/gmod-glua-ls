@@ -51,7 +51,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> Vec<LostFact> {
         lost.extend(
             typed
                 .into_iter()
-                .map(|owner| LostFact::new(owner.get_file_id(), FactKey::TypeCache(owner))),
+                .map(|owner| LostFact::new(owner.get_file_id(), FactKey::type_cache(&owner))),
         );
     }
 
@@ -63,7 +63,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> Vec<LostFact> {
         .derivations_of_file(remap.file_id)
         .flat_map(|id| db.reader_graph().outputs_of(id))
         .filter_map(|key| match key.key() {
-            FactKey::TypeCache(owner) => Some(owner.clone()),
+            FactKey::TypeCache(owner) => Some(owner.to_owner()),
             _ => None,
         })
         .collect::<rustc_hash::FxHashSet<_>>();

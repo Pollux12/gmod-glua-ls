@@ -259,7 +259,7 @@ impl LuaPropertyIndex {
         file_id: FileId,
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
-        derivation::note_write(|| FactKey::Property(same_property_owner_id.clone()));
+        derivation::note_write(|| FactKey::property(same_property_owner_id.clone()));
         self.note_property_write(property_id);
         // Owner aliases are always within one file, so this file owns the property outright
         // unless a doc contribution has already promoted it.
@@ -427,7 +427,7 @@ impl LuaPropertyIndex {
     }
 
     pub fn get_property(&self, owner_id: &LuaSemanticDeclId) -> Option<&LuaCommonProperty> {
-        derivation::note_read(|| FactKey::Property(owner_id.clone()));
+        derivation::note_read(|| FactKey::property(owner_id.clone()));
         self.property_owners_map
             .get(owner_id)
             .and_then(|id| self.properties.get(id))
@@ -437,7 +437,7 @@ impl LuaPropertyIndex {
         &self,
         owner_id: &LuaSemanticDeclId,
     ) -> Option<crate::LuaSignatureId> {
-        derivation::note_read(|| FactKey::Property(owner_id.clone()));
+        derivation::note_read(|| FactKey::property(owner_id.clone()));
         let property_id = self.property_owners_map.get(owner_id)?;
         self.signature_owner_by_property.get(property_id).copied()
     }
@@ -557,7 +557,7 @@ impl LuaPropertyIndex {
             .into_iter()
             .flatten()
         {
-            derivation::note_write(|| FactKey::Property(owner_id.clone()));
+            derivation::note_write(|| FactKey::property(owner_id.clone()));
         }
     }
 
@@ -595,7 +595,7 @@ impl LuaPropertyIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::Property(owner_id) => {
-                let Some(property_id) = self.property_owners_map.get(owner_id) else {
+                let Some(property_id) = self.property_owners_map.get(owner_id.as_ref()) else {
                     return derivation::ABSENT;
                 };
                 derivation::fingerprint_of(&(
@@ -683,7 +683,7 @@ impl LuaIndex for LuaPropertyIndex {
             derivation::note_write(|| FactKey::DeclDefault(*decl_id));
         }
         for owner_id in self.property_owners_map.keys() {
-            derivation::note_write(|| FactKey::Property(owner_id.clone()));
+            derivation::note_write(|| FactKey::property(owner_id.clone()));
         }
         self.properties.clear();
         self.property_owners_map.clear();

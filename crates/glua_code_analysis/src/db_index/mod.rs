@@ -352,7 +352,9 @@ impl DbIndex {
     pub(crate) fn reset_fact(&mut self, key: &derivation::FactKey) {
         use derivation::FactKey as K;
         match key {
-            K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
+            K::TypeCache(owner) => self
+                .get_type_index_mut()
+                .reset_type_cache(&owner.to_owner()),
             K::TypeFallbacks(file_id) => self.get_type_index_mut().retract_fallbacks(*file_id),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
             K::RoleMentions(file_id) => self.remove_role_mentions(*file_id),
@@ -511,7 +513,7 @@ impl DbIndex {
             if fingerprint == stored {
                 continue;
             }
-            derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+            derivation::note_write(|| derivation::FactKey::call_role(key.clone()));
             if fingerprint == derivation::ABSENT {
                 self.call_role_fingerprints.remove(key);
             } else {

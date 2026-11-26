@@ -419,7 +419,7 @@ impl HelperRegistry {
     /// The helper body a global function names, read as that entry.
     fn global(&self, global_id: &GlobalId) -> Option<&(FileId, LuaSyntaxId)> {
         crate::db_index::derivation::note_read(|| {
-            crate::db_index::derivation::FactKey::CallRole(
+            crate::db_index::derivation::FactKey::call_role(
                 crate::db_index::derivation::CallRoleKey::Global(global_id.clone()),
             )
         });
@@ -429,7 +429,7 @@ impl HelperRegistry {
     /// The helper body a method name uniquely names, read as that entry.
     fn method(&self, name: &SmolStr) -> Option<&(FileId, LuaSyntaxId)> {
         crate::db_index::derivation::note_read(|| {
-            crate::db_index::derivation::FactKey::CallRole(
+            crate::db_index::derivation::FactKey::call_role(
                 crate::db_index::derivation::CallRoleKey::Method(name.clone()),
             )
         });
@@ -439,7 +439,7 @@ impl HelperRegistry {
     /// The helper body a signature resolves to, read as that entry.
     fn signature(&self, signature_id: &LuaSignatureId) -> Option<&(FileId, LuaSyntaxId)> {
         crate::db_index::derivation::note_read(|| {
-            crate::db_index::derivation::FactKey::CallRole(
+            crate::db_index::derivation::FactKey::call_role(
                 crate::db_index::derivation::CallRoleKey::Signature(*signature_id),
             )
         });
@@ -8643,7 +8643,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
 
     fn receiver_presence(&self, name: &str) -> AnnotatedGmodCandidatePresence {
         crate::db_index::derivation::note_read(|| {
-            crate::db_index::derivation::FactKey::CallRole(
+            crate::db_index::derivation::FactKey::call_role(
                 crate::db_index::derivation::CallRoleKey::ReceiverMethod(SmolStr::new(name)),
             )
         });
@@ -8691,7 +8691,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
     fn roles(&self, call_path: &str) -> Option<&AnnotatedGmodCallRoles> {
         let entry = |path: &str| {
             crate::db_index::derivation::note_read(|| {
-                crate::db_index::derivation::FactKey::CallRole(
+                crate::db_index::derivation::FactKey::call_role(
                     crate::db_index::derivation::CallRoleKey::Path(SmolStr::new(path)),
                 )
             });

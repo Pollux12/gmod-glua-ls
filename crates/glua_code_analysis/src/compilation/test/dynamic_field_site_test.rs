@@ -164,7 +164,7 @@ e[key] = 4
         ws.def_file(LIB_FILE, "YLib = {}\n");
         let sites = ws.def_file(SITES_FILE, SITES);
         // `x` is declared at offset 6, after `local `.
-        let x = FactKey::TypeCache(LuaTypeOwner::Decl(LuaDeclId::new(
+        let x = FactKey::type_cache(&LuaTypeOwner::Decl(LuaDeclId::new(
             sites,
             rowan::TextSize::new(6),
         )));
