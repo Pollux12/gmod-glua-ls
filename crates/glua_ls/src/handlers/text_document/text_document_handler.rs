@@ -97,22 +97,14 @@ async fn apply_document_update_without_queuing(
     outcome
 }
 
-/// Re-fetches the JSON schemas an edit or a save left pending.
+/// Re-fetches the JSON schemas a save can now resolve.
 ///
-/// `wait` decides how the analysis read lock is taken: the save of a JSON
-/// file always waits for it, while any other save's retry takes the lock
-/// only when free, so a save's schema recheck never queues behind the
-/// re-analysis it would interrupt — the next save retries.
-async fn check_schema_update(context: &ServerContextSnapshot, wait: bool) {
+/// A save is the retry point for schema URLs that a previous fetch left
+/// unresolved; the first attempt for newly registered URLs happens in the
+/// background when an analysis round settles.
+async fn check_schema_update(context: &ServerContextSnapshot) {
     let urls = {
-        let read_analysis = if wait {
-            context.analysis().read().await
-        } else {
-            let Ok(read_analysis) = context.analysis().try_read() else {
-                return;
-            };
-            read_analysis
-        };
+        let read_analysis = context.analysis().read().await;
         if !read_analysis.check_schema_update() {
             return;
         }
@@ -133,15 +125,6 @@ async fn check_schema_update(context: &ServerContextSnapshot, wait: bool) {
 
     let mut write_analysis = context.analysis().write().await;
     write_analysis.apply_fetched_schemas(url_contents);
-}
-
-/// Whether a save of `uri` can change schema inputs: a JSON file may be a
-/// fetched schema or a config that names schemas.
-fn save_can_change_schema_inputs(uri: &lsp_types::Uri) -> bool {
-    uri_to_file_path(uri).is_some_and(|path| {
-        path.extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-    })
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -242,7 +225,7 @@ pub async fn on_did_open_text_document(
 
 pub async fn on_did_save_text_document(
     context: ServerContextSnapshot,
-    params: DidSaveTextDocumentParams,
+    _: DidSaveTextDocumentParams,
 ) -> Option<()> {
     let emmyrc = context.analysis().read().await.get_emmyrc();
     if emmyrc.workspace.enable_reindex {
@@ -251,11 +234,10 @@ pub async fn on_did_save_text_document(
         workspace.recheck_workspace(delay, context.clone()).await;
     }
 
-    // A JSON save may be a fetched schema or a config that names schemas,
-    // so it always rechecks; any other save is only the retry point for
-    // schema URLs an edit registered.
-    let recheck_waits = save_can_change_schema_inputs(&params.text_document.uri);
-    check_schema_update(&context, recheck_waits).await;
+    // The retry point for schema URLs an edit registered: the fetcher's
+    // settled-round attempt may have failed, and a save can also create
+    // the missing file a `file://` URL names.
+    check_schema_update(&context).await;
     Some(())
 }
 
@@ -455,15 +437,18 @@ mod tests {
     use super::*;
     use crate::context::ServerContext;
     use crate::util::TempDir;
+    use glua_code_analysis::JsonSchemaFile;
     use googletest::prelude::*;
     use lsp_server::Connection;
     use lsp_types::{
         ClientCapabilities, SemanticTokensWorkspaceClientCapabilities, TextDocumentItem, Uri,
         WorkspaceClientCapabilities,
     };
+    use std::future::Future;
     use std::str::FromStr;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+    use url::Url;
 
     /// The client asks for an opened document's tokens itself, so opening one
     /// sends no workspace-wide semantic token refresh.
@@ -828,74 +813,167 @@ mod tests {
         })
     }
 
-    /// Only a JSON save counts as one that can change schema inputs: a
-    /// fetched schema or a config that names schemas.
-    #[test]
-    fn only_json_saves_count_as_schema_inputs() {
-        let uri = |path: &str| lsp_types::Uri::from_str(path).expect("uri should parse");
-        assert!(save_can_change_schema_inputs(&uri(
-            "file:///w/.gluarc.json"
-        )));
-        assert!(save_can_change_schema_inputs(&uri("file:///w/.luarc.json")));
-        assert!(save_can_change_schema_inputs(&uri("file:///w/schema.json")));
-        assert!(!save_can_change_schema_inputs(&uri(
-            "file:///w/lua/autorun/init.lua"
-        )));
+    const SCHEMA_JSON: &str =
+        r#"{"title":"Cfg","type":"object","properties":{"port":{"type":"integer"}}}"#;
+
+    /// A context whose temp folder is the main workspace, so documents
+    /// opened in it register their `---@schema` tags, with the folder
+    /// holding `doc.lua` indexed from its disk text.
+    async fn context_with_main_workspace(name: &str) -> (ServerContext, Connection, Uri, TempDir) {
+        let (connection, peer) = Connection::memory();
+        let context = ServerContext::new(connection, ClientCapabilities::default());
+        let folder = TempDir::new(&format!("gmod_glua_ls_{name}"));
+        let doc_path = folder.join("doc.lua");
+        std::fs::write(&doc_path, DISK_TEXT).expect("document should be written");
+        let doc_uri =
+            glua_code_analysis::file_path_to_uri(&doc_path).expect("document URI should parse");
+        {
+            let snapshot = context.snapshot();
+            let mut analysis = snapshot.analysis().write().await;
+            analysis.add_main_workspace(folder.to_path_buf());
+            analysis.update_file_by_uri(&doc_uri, Some(DISK_TEXT.to_string()));
+        }
+        (context, peer, doc_uri, folder)
     }
 
-    /// A best-effort schema recheck skips a held analysis lock instead of
-    /// waiting behind the re-analysis it would interrupt.
-    #[test]
-    fn a_best_effort_recheck_skips_a_held_analysis_lock() {
+    /// Polls `read` every 50 ms until it returns `Some`, or `timeout`
+    /// elapses.
+    async fn eventually<T, P>(timeout: Duration, mut read: impl FnMut() -> P) -> Option<T>
+    where
+        P: Future<Output = Option<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = read().await {
+                return Some(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Whether the schema index holds `url` pending resolution.
+    async fn schema_is_pending(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
+        let analysis = snapshot.analysis().read().await;
+        matches!(
+            analysis
+                .compilation
+                .get_db()
+                .get_json_schema_index()
+                .get_schema_file(url),
+            Some(JsonSchemaFile::NeedResolve)
+        )
+    }
+
+    /// Whether the schema index holds `url` resolved.
+    async fn schema_is_resolved(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
+        let analysis = snapshot.analysis().read().await;
+        matches!(
+            analysis
+                .compilation
+                .get_db()
+                .get_json_schema_index()
+                .get_schema_file(url),
+            Some(JsonSchemaFile::Resolved(_))
+        )
+    }
+
+    /// A `---@schema` tag an edit registers resolves through the fetch a
+    /// settled analysis round wakes, without any save from the client.
+    #[gtest]
+    fn an_edited_schema_tag_resolves_without_a_save() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (connection, _peer) = lsp_server::Connection::memory();
-            let context =
-                crate::context::ServerContext::new(connection, ClientCapabilities::default());
+            let (context, _peer, doc_uri, folder) =
+                context_with_main_workspace("schema_settled").await;
             let snapshot = context.snapshot();
-            let _held = snapshot.analysis().write().await;
+            let schema_path = folder.join("schema.json");
+            std::fs::write(&schema_path, SCHEMA_JSON).expect("schema file should be written");
+            let schema_url = Url::parse(
+                glua_code_analysis::file_path_to_uri(&schema_path)
+                    .expect("schema URI should parse")
+                    .as_str(),
+            )
+            .expect("schema URL should parse");
 
-            let recheck = tokio::time::timeout(
-                Duration::from_millis(500),
-                check_schema_update(&snapshot, false),
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!("---@schema {schema_url}\nlocal x = 1\n"),
             )
             .await;
-            assert!(
-                recheck.is_ok(),
-                "a best-effort recheck must skip a held analysis lock, not wait for it"
-            );
-        });
-        runtime.shutdown_timeout(Duration::from_secs(5));
+
+            let resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &schema_url)
+                    .await
+                    .then_some(())
+            })
+            .await;
+            verify_that!(resolved, some(eq(())))
+        })
     }
 
-    /// A recheck that waits — the save of a JSON file, a schema or a config
-    /// — waits for the analysis lock and completes once it is free.
-    #[test]
-    fn a_waiting_recheck_waits_for_the_analysis_lock() {
+    /// The settled round resolves the fetchable half of a mixed batch and
+    /// leaves the missing file's URL pending — not retired — so the save
+    /// that follows the file's creation resolves it.
+    #[gtest]
+    fn a_missing_schema_file_resolves_on_the_save_after_its_creation() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (connection, _peer) = lsp_server::Connection::memory();
-            let context =
-                crate::context::ServerContext::new(connection, ClientCapabilities::default());
+            let (context, _peer, doc_uri, folder) =
+                context_with_main_workspace("schema_retry").await;
             let snapshot = context.snapshot();
-            let held = snapshot.analysis().write().await;
-
-            let recheck = {
-                let snapshot = snapshot.clone();
-                tokio::spawn(async move {
-                    check_schema_update(&snapshot, true).await;
-                })
+            let schema_url = |name: &str| {
+                Url::parse(
+                    glua_code_analysis::file_path_to_uri(&folder.join(name))
+                        .expect("schema URI should parse")
+                        .as_str(),
+                )
+                .expect("schema URL should parse")
             };
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            assert!(
-                !recheck.is_finished(),
-                "the recheck must wait for the held analysis lock"
-            );
+            let good_url = schema_url("good.json");
+            let missing_url = schema_url("missing.json");
+            std::fs::write(folder.join("good.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
 
-            drop(held);
-            let done = tokio::time::timeout(Duration::from_secs(5), recheck).await;
-            assert!(done.is_ok(), "the recheck completes once the lock is free");
-        });
-        runtime.shutdown_timeout(Duration::from_secs(5));
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!("---@schema {good_url}\n---@schema {missing_url}\nlocal x = 1\n"),
+            )
+            .await;
+
+            let good_resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &good_url).await.then_some(())
+            })
+            .await;
+            verify_that!(good_resolved, some(eq(())))?;
+            verify_that!(schema_is_pending(&snapshot, &missing_url).await, eq(true))?;
+
+            std::fs::write(folder.join("missing.json"), SCHEMA_JSON)
+                .expect("missing schema should be created");
+            on_did_save_text_document(
+                snapshot.clone(),
+                DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    text: None,
+                },
+            )
+            .await;
+
+            let missing_resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &missing_url)
+                    .await
+                    .then_some(())
+            })
+            .await;
+            verify_that!(missing_resolved, some(eq(())))
+        })
     }
 }

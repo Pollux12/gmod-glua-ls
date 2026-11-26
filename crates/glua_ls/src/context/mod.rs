@@ -7,6 +7,7 @@ mod editor_documents;
 mod file_diagnostic;
 mod gmod_projects;
 mod lsp_features;
+mod schema_fetcher;
 mod snapshot;
 mod status_bar;
 mod workspace_manager;
@@ -26,6 +27,7 @@ pub use gmod_projects::{rescope_open_files, send_projects_changed};
 pub use lsp_features::LspFeatures;
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response};
 use lsp_types::{ClientCapabilities, Uri};
+use schema_fetcher::SchemaFetcher;
 pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;
 pub use status_bar::StatusBar;
@@ -186,6 +188,11 @@ impl ServerContext {
             client.clone(),
         ));
         let debounced_shutdown = CancellationToken::new();
+        // Fetches the schemas an analysis round registers, so a
+        // `---@schema` tag an edit adds resolves without waiting for a
+        // save; only started with the other background tasks.
+        let schema_fetch = background_tasks
+            .then(|| SchemaFetcher::spawn(analysis.clone(), debounced_shutdown.clone()));
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis.clone(),
             200,
@@ -193,6 +200,7 @@ impl ServerContext {
             client.clone(),
             file_diagnostic.clone(),
             lsp_features.clone(),
+            schema_fetch,
         ));
         let workspace_manager_inner = WorkspaceManager::new(
             analysis.clone(),

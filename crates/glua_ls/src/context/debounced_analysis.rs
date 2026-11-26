@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use super::schema_fetcher::SchemaFetcher;
 use super::{ClientProxy, FileDiagnostic};
 use crate::handlers::refresh_open_document_features;
 
@@ -114,6 +115,9 @@ pub struct DebouncedAnalysis {
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    /// Fetches the JSON schemas a settled round registered; `None` without
+    /// background tasks, as in tests.
+    schema_fetch: Option<Arc<SchemaFetcher>>,
     /// Re-diagnoses the files an edit's re-analysis reports as affected.
     file_diagnostic: Arc<FileDiagnostic>,
     debounce_duration: Duration,
@@ -224,6 +228,7 @@ impl DebouncedAnalysis {
         client: Arc<ClientProxy>,
         file_diagnostic: Arc<FileDiagnostic>,
         lsp_features: Arc<crate::context::LspFeatures>,
+        schema_fetch: Option<Arc<SchemaFetcher>>,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
@@ -248,6 +253,7 @@ impl DebouncedAnalysis {
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
+            schema_fetch,
             file_diagnostic,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
@@ -1187,6 +1193,12 @@ impl DebouncedAnalysis {
                     }
                     self.refresh_dirty_state().await;
                     crate::util::spawn_release_free_memory();
+                    // A settled round is when a newly registered `---@schema`
+                    // URL becomes visible; the fetcher resolves it in the
+                    // background without holding the analysis lock.
+                    if let Some(schema_fetch) = self.schema_fetch.as_ref() {
+                        schema_fetch.wake();
+                    }
                 }
                 // A didChange applied its text; its schedule pre-empts.
                 UpdateProgress::TextChanged => text_changed = true,
@@ -1333,6 +1345,7 @@ mod tests {
             client,
             file_diagnostic,
             test_lsp_features(),
+            None,
         ))
     }
 
@@ -1876,6 +1889,7 @@ mod tests {
                 client,
                 file_diagnostic.clone(),
                 test_lsp_features(),
+                None,
             ));
             file_diagnostic.store().start(1, debounced_analysis.clone());
 
@@ -1956,6 +1970,7 @@ mod tests {
             client,
             file_diagnostic.clone(),
             test_lsp_features(),
+            None,
         ));
         file_diagnostic.store().start(1, debounced_analysis.clone());
         (debounced_analysis, peer)
@@ -2096,6 +2111,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2165,6 +2181,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2252,6 +2269,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2333,6 +2351,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2665,6 +2684,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2808,6 +2828,7 @@ mod tests {
                 client,
                 file_diagnostic.clone(),
                 Arc::new(features),
+                None,
             );
             let (edited, closed, open) = (FileId::new(1), FileId::new(2), FileId::new(3));
             let store = file_diagnostic.store();
