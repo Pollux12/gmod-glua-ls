@@ -3,7 +3,7 @@ use std::time::Duration;
 use log::info;
 use serde_json::Value;
 
-use crate::{context::ServerContextSnapshot, util::time_cancel_token};
+use crate::context::ServerContextSnapshot;
 use glua_code_analysis::file_path_to_uri;
 
 use super::ClientConfig;
@@ -41,9 +41,8 @@ pub async fn get_client_config_default(
                 .collect(),
         };
         log::info!("fetching client config for scope {scope:?}");
-        let cancel_token = time_cancel_token(Duration::from_secs(5));
         let fetched_configs: Vec<_> = match client
-            .get_configuration::<Value>(params, cancel_token)
+            .get_configuration::<Value>(params, Duration::from_secs(5))
             .await
         {
             Some(configs) => configs,

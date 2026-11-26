@@ -12,6 +12,7 @@ mod status_bar;
 mod workspace_manager;
 
 pub use client::ClientProxy;
+pub(crate) use client::USER_ANSWERED_REQUEST_TIMEOUT;
 pub use client_id::{ClientId, get_client_id};
 #[cfg(test)]
 pub(crate) use debounced_analysis::expedites_debounce;

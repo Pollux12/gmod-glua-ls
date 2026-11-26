@@ -1,11 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use lsp_types::{
     NumberOrString, ProgressParams, ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
     WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };
-
-use crate::util::time_cancel_token;
+use tokio_util::sync::CancellationToken;
 
 use super::ClientProxy;
 
@@ -52,7 +52,6 @@ impl StatusBar {
         }
 
         let request_id = self.client.next_id();
-        let cancel_token = time_cancel_token(std::time::Duration::from_secs(5));
         let _ = self
             .client
             .send_request(
@@ -61,7 +60,8 @@ impl StatusBar {
                 WorkDoneProgressCreateParams {
                     token: NumberOrString::Number(task.as_i32()),
                 },
-                cancel_token,
+                CancellationToken::new(),
+                Duration::from_secs(5),
             )
             .await;
         self.client.send_notification(
