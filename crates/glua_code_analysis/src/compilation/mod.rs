@@ -356,7 +356,7 @@ impl LuaCompilation {
         if derivation::recording() {
             return diagnose();
         }
-        if self.db.get_vfs().get_syntax_tree(&file_id).is_none() {
+        if !self.db.get_vfs().has_file(&file_id) {
             return diagnose();
         }
         let _recording = derivation::begin(DerivationId::diagnostics(file_id));

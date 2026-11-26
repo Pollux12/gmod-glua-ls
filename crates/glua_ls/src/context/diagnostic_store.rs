@@ -766,6 +766,17 @@ impl DiagnosticStore {
                 .compilation
                 .file_some_diagnostic_reads(FILED_PER_LOCK)
             {
+                let open = self.state().open.clone();
+                let evicted = analysis
+                    .compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .evict_cold_trees(|id| open.contains(id));
+                drop(analysis);
+                if !evicted.is_empty() {
+                    drop(evicted);
+                    crate::util::spawn_release_free_memory();
+                }
                 return;
             }
             drop(analysis);

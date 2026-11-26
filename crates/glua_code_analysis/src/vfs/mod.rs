@@ -22,7 +22,7 @@ use rowan::NodeCache;
 use rowan::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 pub use virtual_url::VirtualUrlGenerator;
 
 use crate::compilation::analyzer::parallel::map_items_init;
@@ -40,8 +40,8 @@ pub struct Vfs {
     order_roots: Vec<(String, u8)>,
     remote_file_id_map: FxHashMap<Uri, FileId>,
     file_data: Vec<Option<FileContent>>,
-    line_index_map: FxHashMap<FileId, LineIndex>,
-    tree_map: FxHashMap<FileId, LuaSyntaxTree>,
+    line_index_map: FxHashMap<FileId, Arc<OnceLock<LineIndex>>>,
+    tree_map: FxHashMap<FileId, Arc<OnceLock<LuaSyntaxTree>>>,
     emmyrc: Option<Arc<Emmyrc>>,
     /// Monotonic counter bumped whenever file *content* (or existence) changes.
     /// Lets workspace-wide derived caches (e.g. the gmod helper registry) detect
@@ -89,6 +89,23 @@ fn statement_around(tree: &LuaSyntaxTree, range: TextRange) -> Option<LuaSyntaxN
 #[derive(Default)]
 pub struct DeferredVfsDrop {
     _replaced: Option<Staged>,
+}
+
+/// Evicted syntax trees and line indexes, to drop off any analysis lock.
+#[derive(Default)]
+pub struct EvictedVfsData {
+    trees: Vec<Arc<OnceLock<LuaSyntaxTree>>>,
+    line_indexes: Vec<Arc<OnceLock<LineIndex>>>,
+}
+
+impl EvictedVfsData {
+    pub fn evicted_trees(&self) -> usize {
+        self.trees.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trees.is_empty() && self.line_indexes.is_empty()
+    }
 }
 
 /// A file's newest text until a re-analysis takes it.
@@ -312,14 +329,36 @@ impl Vfs {
         })
     }
 
-    fn parse(&self, text: &str) -> (LuaSyntaxTree, LineIndex) {
+    fn parse_tree(&self, text: &str) -> LuaSyntaxTree {
         let mut node_cache = NodeCache::default();
         let parse_config = self
             .emmyrc
             .as_ref()
             .expect("emmyrc set")
             .get_parse_config(&mut node_cache);
-        (LuaParser::parse(text, parse_config), LineIndex::parse(text))
+        LuaParser::parse(text, parse_config)
+    }
+
+    fn parse(&self, text: &str) -> (LuaSyntaxTree, LineIndex) {
+        (self.parse_tree(text), LineIndex::parse(text))
+    }
+
+    fn tree_for(&self, id: &FileId) -> Option<&LuaSyntaxTree> {
+        let cell = self.tree_map.get(id)?;
+        if let Some(tree) = cell.get() {
+            return Some(tree);
+        }
+        let text = &self.file_data.get(id.id as usize)?.as_ref()?.content;
+        Some(cell.get_or_init(|| self.parse_tree(text)))
+    }
+
+    fn line_index_for(&self, id: &FileId) -> Option<&LineIndex> {
+        let cell = self.line_index_map.get(id)?;
+        if let Some(index) = cell.get() {
+            return Some(index);
+        }
+        let text = &self.file_data.get(id.id as usize)?.as_ref()?.content;
+        Some(cell.get_or_init(|| LineIndex::parse(text)))
     }
 
     /// Stages `content` as `fid`'s newest text, replacing what an earlier
@@ -481,8 +520,12 @@ impl Vfs {
             None => self
                 .tree_map
                 .get(&fid)
-                .cloned()
-                .zip(self.line_index_map.get(&fid).cloned()),
+                .and_then(|cell| cell.get().cloned())
+                .zip(
+                    self.line_index_map
+                        .get(&fid)
+                        .and_then(|cell| cell.get().cloned()),
+                ),
         };
         let parsed = reused
             .filter(|_| self.latest_content(&fid) == Some(&text))
@@ -554,8 +597,10 @@ impl Vfs {
             *slot = staged.content;
             match staged.parsed {
                 Some((tree, line_index)) => {
-                    self.tree_map.insert(*file_id, tree);
-                    self.line_index_map.insert(*file_id, line_index);
+                    self.tree_map
+                        .insert(*file_id, Arc::new(OnceLock::from(tree)));
+                    self.line_index_map
+                        .insert(*file_id, Arc::new(OnceLock::from(line_index)));
                 }
                 None => {
                     self.tree_map.remove(file_id);
@@ -581,15 +626,18 @@ impl Vfs {
     }
 
     fn reparse_all(&mut self) {
+        let mut evicted_ids = Vec::new();
         let (ids, trees) = {
-            let mut taken = self
-                .tree_map
-                .keys()
-                .filter_map(|id| {
-                    let data = self.file_data.get(id.id as usize)?.as_ref()?;
-                    Some((*id, data.content.as_str()))
-                })
-                .collect::<Vec<_>>();
+            let mut taken = Vec::new();
+            for (id, cell) in &self.tree_map {
+                if cell.get().is_none() {
+                    evicted_ids.push(*id);
+                    continue;
+                }
+                if let Some(data) = self.file_data.get(id.id as usize).and_then(Option::as_ref) {
+                    taken.push((*id, data.content.as_str()));
+                }
+            }
             taken.sort_by_key(|(id, _)| *id);
             let texts = taken.iter().map(|(_, text)| *text).collect::<Vec<_>>();
             let trees = self.parse_concurrently(&texts).unwrap_or_else(|| {
@@ -603,8 +651,11 @@ impl Vfs {
                 trees,
             )
         };
+        for id in evicted_ids {
+            self.tree_map.insert(id, Arc::new(OnceLock::new()));
+        }
         for (id, (tree, _)) in ids.into_iter().zip(trees) {
-            self.tree_map.insert(id, tree);
+            self.tree_map.insert(id, Arc::new(OnceLock::from(tree)));
         }
         let staged = self
             .staged
@@ -671,7 +722,7 @@ impl Vfs {
         range: TextRange,
         statement: fn(&LuaSyntaxTree, TextRange) -> Option<LuaSyntaxNode>,
     ) -> Option<&LuaSyntaxTree> {
-        let tree = self.tree_map.get(id)?;
+        let tree = self.tree_for(id)?;
         if crate::db_index::derivation::recording() {
             match statement(tree, range) {
                 Some(statement) => {
@@ -692,8 +743,7 @@ impl Vfs {
         site: &InFiled<TextRange>,
     ) -> crate::db_index::derivation::Fingerprint {
         let statement = self
-            .tree_map
-            .get(&site.file_id)
+            .tree_for(&site.file_id)
             .and_then(|tree| statement_around(tree, site.value))
             .filter(|statement| statement.text_range() == site.value)
             .and_then(|statement| {
@@ -762,17 +812,45 @@ impl Vfs {
     pub fn get_document(&self, id: &FileId) -> Option<LuaDocument<'_>> {
         let path = self.get_file_path(id)?;
         let text = self.get_file_content(id)?;
-        let line_index = self.line_index_map.get(id)?;
+        let line_index = self.line_index_for(id)?;
         Some(LuaDocument::new(*id, path, text, line_index))
+    }
+
+    /// Whether `id` currently holds a live parsed file without triggering a
+    /// lazy reparse if its syntax tree was evicted.
+    pub fn has_file(&self, id: &FileId) -> bool {
+        self.tree_map.contains_key(id)
+    }
+
+    /// Drops cached syntax trees and line indexes for every file where `keep`
+    /// returns `false`. Subsequent reads lazily reparse from the retained file
+    /// text.
+    pub fn evict_cold_trees(&mut self, keep: impl Fn(&FileId) -> bool) -> EvictedVfsData {
+        let mut evicted = EvictedVfsData::default();
+        for (file_id, cell) in &mut self.tree_map {
+            if !keep(file_id) && cell.get().is_some() {
+                evicted
+                    .trees
+                    .push(std::mem::replace(cell, Arc::new(OnceLock::new())));
+            }
+        }
+        for (file_id, cell) in &mut self.line_index_map {
+            if !keep(file_id) && cell.get().is_some() {
+                evicted
+                    .line_indexes
+                    .push(std::mem::replace(cell, Arc::new(OnceLock::new())));
+            }
+        }
+        evicted
     }
 
     pub fn get_syntax_tree(&self, id: &FileId) -> Option<&LuaSyntaxTree> {
         crate::db_index::derivation::note_file_read(*id);
-        self.tree_map.get(id)
+        self.tree_for(id)
     }
 
     pub fn get_file_parse_error(&self, id: &FileId) -> Option<Vec<LuaParseError>> {
-        let tree = self.tree_map.get(id)?;
+        let tree = self.tree_for(id)?;
         let errors = tree.get_errors();
         if errors.is_empty() {
             return None;
@@ -1402,5 +1480,70 @@ mod tests {
         vfs.update_config(Arc::new(Emmyrc::default()));
         let fid_b_after = vfs.set_remote_file_content(&uri_b, Some("{}".to_string()));
         assert_eq!(fid_b_after, super::FileId { id: 0 });
+    }
+
+    #[test]
+    fn evict_cold_trees_frees_non_kept_files_and_lazily_reparses_on_read() {
+        let mut vfs = new_vfs();
+        let uri_a: Uri = "file:///a.lua".parse().expect("valid uri");
+        let uri_b: Uri = "file:///b.lua".parse().expect("valid uri");
+        let text_a = "local alpha = 1\nreturn alpha\n";
+        let text_b = "local beta = 2\nreturn beta\n";
+
+        let fid_a = vfs.set_file_content(&uri_a, Some(text_a.to_string()));
+        let fid_b = vfs.set_file_content(&uri_b, Some(text_b.to_string()));
+        vfs.take_staged(&[fid_a, fid_b]);
+
+        let fp_before = vfs.file_set_fingerprint();
+        let stmt_range = rowan::TextRange::new(0.into(), 15.into());
+        let stmt_fp_before = vfs.statement_fingerprint(&super::InFiled::new(fid_b, stmt_range));
+
+        let mut keep = rustc_hash::FxHashSet::default();
+        keep.insert(fid_a);
+        let evicted = vfs.evict_cold_trees(|id| keep.contains(id));
+        assert_eq!(evicted.evicted_trees(), 1);
+        assert!(vfs.tree_map[&fid_a].get().is_some());
+        assert!(vfs.tree_map[&fid_b].get().is_none());
+        assert!(vfs.line_index_map[&fid_b].get().is_none());
+
+        // `has_file` and `file_set_fingerprint` stay invariant without reparsing.
+        assert!(vfs.has_file(&fid_b));
+        assert_eq!(vfs.file_set_fingerprint(), fp_before);
+        assert!(vfs.tree_map[&fid_b].get().is_none());
+
+        // Reading tree, document, or statement fingerprint lazily reparses.
+        let doc = vfs.get_document(&fid_b).expect("document");
+        assert_eq!(doc.get_text(), text_b);
+        assert!(vfs.line_index_map[&fid_b].get().is_some());
+        assert_eq!(
+            vfs.statement_fingerprint(&super::InFiled::new(fid_b, stmt_range)),
+            stmt_fp_before
+        );
+        assert_eq!(
+            vfs.get_syntax_tree(&fid_b)
+                .expect("tree")
+                .get_red_root()
+                .text()
+                .to_string(),
+            text_b
+        );
+
+        // Moving an evicted file reparses cleanly without panicking.
+        let evicted_again = vfs.evict_cold_trees(|_| false);
+        assert_eq!(evicted_again.evicted_trees(), 2);
+        let uri_c: Uri = "file:///c.lua".parse().expect("valid uri");
+        assert_eq!(
+            vfs.move_file(&uri_b, &uri_c, text_b.to_string()),
+            Some(fid_b)
+        );
+        vfs.take_staged(&[fid_b]);
+        assert_eq!(
+            vfs.get_syntax_tree(&fid_b)
+                .expect("moved tree")
+                .get_red_root()
+                .text()
+                .to_string(),
+            text_b
+        );
     }
 }

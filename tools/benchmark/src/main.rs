@@ -925,6 +925,16 @@ async fn run() {
         eprintln!("[mem] {}", analysis.compilation.memory_census());
     }
     alloc_report!("diagnostics", alloc_mark);
+    {
+        let evicted = analysis
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .evict_cold_trees(|_| false);
+        drop(evicted);
+        glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+        glua_code_analysis::profile::memory::checkpoint("after evicting cold vfs");
+    }
     results.push(BenchmarkResult {
         phase: format!(
             "diagnostics ({} files, {} issues)",

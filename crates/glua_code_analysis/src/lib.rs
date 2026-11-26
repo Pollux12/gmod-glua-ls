@@ -536,7 +536,7 @@ impl EmmyLuaAnalysis {
             UpdateProgress::Settled(mut affected) => {
                 let vfs = self.compilation.get_db_mut().get_vfs_mut();
                 vfs.forget_taken_deletions();
-                affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+                affected.retain(|file_id| vfs.has_file(file_id));
                 UpdateProgress::Settled(affected)
             }
             progress => progress,
@@ -551,7 +551,7 @@ impl EmmyLuaAnalysis {
         let mut affected = self.compilation.update_index(file_ids.clone());
         affected.extend(file_ids);
         let vfs = self.compilation.get_db().get_vfs();
-        affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+        affected.retain(|file_id| vfs.has_file(file_id));
         affected.sort_unstable();
         affected.dedup();
         affected
