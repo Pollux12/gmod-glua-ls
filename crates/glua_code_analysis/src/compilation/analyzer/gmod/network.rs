@@ -2273,82 +2273,242 @@ fn helper_receive_body(
         return cached.clone();
     }
 
-    let mut bodies = Vec::new();
-    let mut seen_states = HashSet::default();
-    let mut active_helpers = Vec::new();
-    collect_receive_bodies(
+    // Build the finite reachable `(HelperId, bindings, fns)` state graph (stopping
+    // expansion at already-memoized states and guarding against string-growing cycles
+    // via `active_helpers`), then condense cycles with Tarjan SCCs so DAG diamonds
+    // keep exact path multiplicity while cyclic helper graphs stay O(V + E).
+    struct Node {
+        key: HelperBoundKey,
+        direct: Vec<CachedReceiveBody>,
+        edges: Vec<usize>,
+        from_memo: Option<Vec<CachedReceiveBody>>,
+    }
+
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut node_index: HashMap<HelperBoundKey, usize> = HashMap::default();
+    let mut active_helpers: Vec<HelperId> = Vec::new();
+
+    fn discover(
+        ctx: &mut NetCollectCtx<'_>,
+        state_key: HelperBoundKey,
+        bindings: HashMap<String, String>,
+        nodes: &mut Vec<Node>,
+        node_index: &mut HashMap<HelperBoundKey, usize>,
+        active_helpers: &mut Vec<HelperId>,
+    ) -> Option<usize> {
+        if !ctx.reach(&state_key.0).receive {
+            return None;
+        }
+        if let Some(&idx) = node_index.get(&state_key) {
+            return Some(idx);
+        }
+        if active_helpers.contains(&state_key.0) {
+            return None;
+        }
+        let idx = nodes.len();
+        node_index.insert(state_key.clone(), idx);
+        if let Some(cached) = ctx.memo.receive_body.get(&state_key).cloned() {
+            nodes.push(Node {
+                key: state_key,
+                direct: Vec::new(),
+                edges: Vec::new(),
+                from_memo: Some(cached),
+            });
+            return Some(idx);
+        }
+        nodes.push(Node {
+            key: state_key.clone(),
+            direct: Vec::new(),
+            edges: Vec::new(),
+            from_memo: None,
+        });
+
+        active_helpers.push(state_key.0.clone());
+        let helper = ctx.helper(&state_key.0);
+        let mut direct = Vec::new();
+        let mut edges = Vec::new();
+        for call in helper.calls.iter().filter(|call| !call.nested) {
+            match &call.role {
+                Some(NetCallRole::Receive { message_idx, .. }) => {
+                    if call.literal_receive {
+                        continue;
+                    }
+                    let Some(message_name) = resolve_arg(&call.args, *message_idx, &bindings)
+                    else {
+                        continue;
+                    };
+                    let (reads, reads_opaque) =
+                        compose_receive_reads(ctx, &call.receive_reads, &state_key.2);
+                    direct.push(CachedReceiveBody {
+                        message_name,
+                        reads,
+                        reads_opaque,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    let Some(target) = &call.target else {
+                        continue;
+                    };
+                    if !ctx.reach(target).receive {
+                        continue;
+                    }
+                    let child_helper = ctx.helper(target);
+                    let child_bindings =
+                        helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
+                    let child_fns =
+                        helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
+                    let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
+                    if let Some(child_idx) = discover(
+                        ctx,
+                        child_key,
+                        child_bindings,
+                        nodes,
+                        node_index,
+                        active_helpers,
+                    ) {
+                        edges.push(child_idx);
+                    }
+                }
+            }
+        }
+        active_helpers.pop();
+        nodes[idx].direct = direct;
+        nodes[idx].edges = edges;
+        Some(idx)
+    }
+
+    let Some(root_idx) = discover(
         ctx,
         root_key.clone(),
         root_bindings,
-        &mut seen_states,
+        &mut nodes,
+        &mut node_index,
         &mut active_helpers,
-        &mut bodies,
-    );
-    ctx.memo.receive_body.insert(root_key, bodies.clone());
-    bodies
-}
+    ) else {
+        return Vec::new();
+    };
 
-fn collect_receive_bodies(
-    ctx: &mut NetCollectCtx<'_>,
-    state_key: HelperBoundKey,
-    bindings: HashMap<String, String>,
-    seen_states: &mut HashSet<HelperBoundKey>,
-    active_helpers: &mut Vec<HelperId>,
-    bodies: &mut Vec<CachedReceiveBody>,
-) {
-    if !ctx.reach(&state_key.0).receive {
-        return;
-    }
-    if active_helpers.contains(&state_key.0) || !seen_states.insert(state_key.clone()) {
-        return;
-    }
-    active_helpers.push(state_key.0.clone());
-    let helper = ctx.helper(&state_key.0);
+    // Tarjan SCCs (emitted in reverse topological order: sinks first).
+    let n = nodes.len();
+    let mut index_counter = 0u32;
+    let mut indices = vec![u32::MAX; n];
+    let mut lowlink = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut tarjan_stack = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
 
-    for call in helper.calls.iter().filter(|call| !call.nested) {
-        match &call.role {
-            Some(NetCallRole::Receive { message_idx, .. }) => {
-                if call.literal_receive {
-                    continue;
-                }
-                let Some(message_name) = resolve_arg(&call.args, *message_idx, &bindings) else {
-                    continue;
-                };
-                let (reads, reads_opaque) =
-                    compose_receive_reads(ctx, &call.receive_reads, &state_key.2);
-                bodies.push(CachedReceiveBody {
-                    message_name,
-                    reads,
-                    reads_opaque,
-                });
-            }
-            Some(_) => {}
-            None => {
-                let Some(target) = &call.target else {
-                    continue;
-                };
-                if !ctx.reach(target).receive {
-                    continue;
-                }
-                let child_helper = ctx.helper(target);
-                let child_bindings =
-                    helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
-                let child_fns =
-                    helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
-                let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
-                collect_receive_bodies(
-                    ctx,
-                    child_key,
-                    child_bindings,
-                    seen_states,
-                    active_helpers,
-                    bodies,
+    #[allow(clippy::too_many_arguments)]
+    fn strongconnect(
+        v: usize,
+        nodes: &[Node],
+        index_counter: &mut u32,
+        indices: &mut [u32],
+        lowlink: &mut [u32],
+        on_stack: &mut [bool],
+        tarjan_stack: &mut Vec<usize>,
+        sccs: &mut Vec<Vec<usize>>,
+    ) {
+        indices[v] = *index_counter;
+        lowlink[v] = *index_counter;
+        *index_counter += 1;
+        tarjan_stack.push(v);
+        on_stack[v] = true;
+        for &w in &nodes[v].edges {
+            if indices[w] == u32::MAX {
+                strongconnect(
+                    w,
+                    nodes,
+                    index_counter,
+                    indices,
+                    lowlink,
+                    on_stack,
+                    tarjan_stack,
+                    sccs,
                 );
+                lowlink[v] = lowlink[v].min(lowlink[w]);
+            } else if on_stack[w] {
+                lowlink[v] = lowlink[v].min(indices[w]);
+            }
+        }
+        if lowlink[v] == indices[v] {
+            let mut scc = Vec::new();
+            while let Some(w) = tarjan_stack.pop() {
+                on_stack[w] = false;
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            sccs.push(scc);
+        }
+    }
+
+    for v in 0..n {
+        if indices[v] == u32::MAX {
+            strongconnect(
+                v,
+                &nodes,
+                &mut index_counter,
+                &mut indices,
+                &mut lowlink,
+                &mut on_stack,
+                &mut tarjan_stack,
+                &mut sccs,
+            );
+        }
+    }
+
+    let mut comp_of = vec![0usize; n];
+    for (cid, scc) in sccs.iter().enumerate() {
+        for &v in scc {
+            comp_of[v] = cid;
+        }
+    }
+
+    let mut results: Vec<Vec<CachedReceiveBody>> = vec![Vec::new(); n];
+    for (cid, scc) in sccs.iter().enumerate() {
+        if scc.len() == 1 {
+            let v = scc[0];
+            let bodies = if let Some(memo) = &nodes[v].from_memo {
+                memo.clone()
+            } else {
+                let mut out = nodes[v].direct.clone();
+                for &w in &nodes[v].edges {
+                    if w != v {
+                        out.extend(results[w].iter().cloned());
+                    }
+                }
+                out
+            };
+            ctx.memo
+                .receive_body
+                .insert(nodes[v].key.clone(), bodies.clone());
+            results[v] = bodies;
+        } else {
+            // Cyclic SCC: each member contributes its direct registrations and
+            // external SCC outputs once in deterministic discovery order.
+            let mut ordered = scc.clone();
+            ordered.sort_unstable();
+            let mut combined = Vec::new();
+            for &v in &ordered {
+                combined.extend(nodes[v].direct.iter().cloned());
+                for &w in &nodes[v].edges {
+                    if comp_of[w] != cid {
+                        combined.extend(results[w].iter().cloned());
+                    }
+                }
+            }
+            for &v in &ordered {
+                ctx.memo
+                    .receive_body
+                    .insert(nodes[v].key.clone(), combined.clone());
+                results[v] = combined.clone();
             }
         }
     }
 
-    active_helpers.pop();
+    results.swap_remove(root_idx)
 }
 
 /// The writes of `stat` outside the parts `replaced` gives to another message,
