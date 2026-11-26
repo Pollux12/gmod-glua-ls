@@ -179,7 +179,6 @@ mod test {
         let stored = db
             .get_call_target_index()
             .target(caller, call.get_range())
-            .cloned()
             .expect("the call's target is stored");
         let fresh = resolve_call_target(db, &mut LuaInferCache::new(caller, pass_view()), &call);
 

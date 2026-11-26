@@ -110,11 +110,11 @@ fn hook_callbacks_of(
 /// What `call_expr`, one of `file_id`'s calls, targets, for a pass ranked after
 /// the `CallTarget` derivations and starting at the same stage, so that the
 /// call's ran first.
-pub(super) fn call_target_of<'a>(
-    db: &'a DbIndex,
+pub(super) fn call_target_of(
+    db: &DbIndex,
     file_id: FileId,
     call_expr: &LuaCallExpr,
-) -> Option<&'a LuaCallTarget> {
+) -> Option<LuaCallTarget> {
     let target = db
         .get_call_target_index()
         .target(file_id, call_expr.get_range());
@@ -149,7 +149,7 @@ pub(super) fn check_settled_call_targets(db: &DbIndex) {
                 continue;
             };
             let fresh = resolve_call_target(db, &mut cache, &call_expr);
-            if *stored != fresh {
+            if stored != fresh {
                 eprintln!(
                     "[cache] call target mismatch {file_id:?} {range:?} stored={stored:?} fresh={fresh:?}",
                 );

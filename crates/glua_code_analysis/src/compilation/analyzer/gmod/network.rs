@@ -214,13 +214,13 @@ struct NetCallFact {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NetOpItem {
     /// `dynamic` and `flow_path` are relative to the walked block.
-    Op(NetOpEntry),
+    Op(Box<NetOpEntry>),
     Helper {
         target: HelperId,
         dynamic: bool,
-        flow_path: Vec<NetFlowFrame>,
+        flow_path: Box<[NetFlowFrame]>,
         /// The functions the call passes, by argument position.
-        fn_args: Vec<Option<FnArg>>,
+        fn_args: Box<[Option<FnArg>]>,
         /// Whether the call is written with `:`, passing its receiver first.
         colon_call: bool,
     },
@@ -229,7 +229,7 @@ enum NetOpItem {
     Param {
         idx: usize,
         dynamic: bool,
-        flow_path: Vec<NetFlowFrame>,
+        flow_path: Box<[NetFlowFrame]>,
     },
     /// A call of an enclosing function's parameter, which no caller of the
     /// walked function binds: it runs a function handed to the transaction.
@@ -292,18 +292,18 @@ struct NetReceiveReads {
 struct HelperCall {
     /// Inside a closure nested in the helper: only reachability sees it.
     nested: bool,
-    role: Option<NetCallRole>,
+    role: Option<Box<NetCallRole>>,
     target: Option<HelperId>,
-    args: Vec<Option<StringTemplate>>,
+    args: Box<[Option<StringTemplate>]>,
     /// The functions the call passes, by argument position.
-    fn_args: Vec<Option<FnArg>>,
+    fn_args: Box<[Option<FnArg>]>,
     /// Whether the call is written with `:`, passing its receiver first.
     colon_call: bool,
     /// A send's recipient snippet.
-    send_target: Option<String>,
+    send_target: Option<Box<str>>,
     /// A receive with a literal message name, already indexed where it is.
     literal_receive: bool,
-    receive_reads: NetReceiveReads,
+    receive_reads: Option<Box<NetReceiveReads>>,
 }
 
 /// A `net.Start` .. send transaction written directly in a helper body.
@@ -346,7 +346,7 @@ impl NetOpItem {
         let (target, fn_args) = match self {
             NetOpItem::Helper {
                 target, fn_args, ..
-            } => (Some(target), fn_args.as_slice()),
+            } => (Some(target), &**fn_args),
             NetOpItem::Op(_) | NetOpItem::Param { .. } | NetOpItem::Opaque => (None, &[][..]),
         };
         target.into_iter().chain(fn_arg_bodies(fn_args))
@@ -387,8 +387,9 @@ impl NetHelper {
             targets.extend(fn_arg_bodies(&call.fn_args));
             targets.extend(
                 call.receive_reads
-                    .items
-                    .iter()
+                    .as_deref()
+                    .and_then(|reads| reads.items.as_ref())
+                    .into_iter()
                     .flatten()
                     .flat_map(NetOpItem::targets),
             );
@@ -410,8 +411,10 @@ impl NetHelper {
                 visit(target);
             }
             visit_fn_arg_bodies(&mut call.fn_args, visit);
-            for item in call.receive_reads.items.iter_mut().flatten() {
-                item.visit_targets(visit);
+            if let Some(reads) = call.receive_reads.as_deref_mut() {
+                for item in reads.items.iter_mut().flatten() {
+                    item.visit_targets(visit);
+                }
             }
         }
         for item in &mut self.ops {
@@ -625,6 +628,12 @@ pub(crate) fn evaluate_net_call(
     let Some(fact) = net_call_fact(db, file_id, &call_expr, &roles.registry, syntax) else {
         return;
     };
+    if fact.role.is_none() && fact.bits_param_idx.is_none() && !fact.candidate {
+        if let Some(target) = fact.target {
+            db.set_net_call_target_only(file_id, call_expr.get_range(), target);
+            return;
+        }
+    }
     db.set_net_call(file_id, call_expr.get_range(), Arc::new(fact));
 }
 
@@ -637,7 +646,7 @@ fn net_call_fact(
     syntax: &FileNetSyntax,
 ) -> Option<NetCallFact> {
     let signature_id = super::super::call_target::call_target_of(db, file_id, call_expr)
-        .and_then(crate::LuaCallTarget::signature_id);
+        .and_then(|target| target.signature_id());
     let role = signature_id.and_then(|signature_id| net_call_role(db, call_expr, signature_id));
     let target = resolve_call_to_function_block(
         file_id,
@@ -777,17 +786,23 @@ impl<'a> NetFileSite<'a> {
         }
     }
 
-    fn call(&self, call_expr: &LuaCallExpr) -> Option<Arc<NetCallFact>> {
+    fn call(&self, call_expr: &LuaCallExpr) -> Option<crate::db_index::NetCallLookup<NetCallFact>> {
         self.db
             .get_net_call::<NetCallFact>(self.file_id, call_expr.get_range())
     }
 
     fn role(&self, call_expr: &LuaCallExpr) -> Option<NetCallRole> {
-        self.call(call_expr).and_then(|fact| fact.role.clone())
+        match self.call(call_expr)? {
+            crate::db_index::NetCallLookup::TargetOnly(_) => None,
+            crate::db_index::NetCallLookup::Full(fact) => fact.role.clone(),
+        }
     }
 
     fn target(&self, call_expr: &LuaCallExpr) -> Option<HelperId> {
-        self.call(call_expr).and_then(|fact| fact.target.clone())
+        match self.call(call_expr)? {
+            crate::db_index::NetCallLookup::TargetOnly(target) => Some(target),
+            crate::db_index::NetCallLookup::Full(fact) => fact.target.clone(),
+        }
     }
 
     /// The body of the function a bare name defines once in the file.
@@ -861,40 +876,47 @@ fn summarize_helper_call(
     block: &LuaBlock,
     call_expr: &LuaCallExpr,
 ) -> HelperCall {
-    let (role, target) = site
-        .call(call_expr)
-        .map(|fact| (fact.role.clone(), fact.target.clone()))
-        .unwrap_or_default();
+    let (role, target) = match site.call(call_expr) {
+        Some(crate::db_index::NetCallLookup::TargetOnly(target)) => (None, Some(target)),
+        Some(crate::db_index::NetCallLookup::Full(fact)) => {
+            (fact.role.clone().map(Box::new), fact.target.clone())
+        }
+        None => (None, None),
+    };
     let mut call = HelperCall {
         nested: is_call_expr_in_nested_closure(block, call_expr),
         role,
         target,
-        args: Vec::new(),
-        fn_args: Vec::new(),
+        args: Box::default(),
+        fn_args: Box::default(),
         colon_call: call_expr.is_colon_call(),
         send_target: None,
         literal_receive: false,
-        receive_reads: NetReceiveReads::default(),
+        receive_reads: None,
     };
     if call.nested {
         return call;
     }
-    call.args = arg_templates(call_expr);
+    call.args = arg_templates(call_expr).into_boxed_slice();
     if call.target.is_some() {
-        call.fn_args = call_fn_args(site, owner, call_expr);
+        call.fn_args = call_fn_args(site, owner, call_expr).into_boxed_slice();
     }
-    match call.role {
+    match call.role.as_deref() {
         Some(NetCallRole::Send(send_kind)) => {
-            call.send_target = extract_send_target_text(call_expr, send_kind);
+            call.send_target =
+                extract_send_target_text(call_expr, *send_kind).map(String::into_boxed_str);
         }
         Some(NetCallRole::Receive {
             message_idx,
             callback_idx,
         }) => {
             call.literal_receive =
-                !extract_static_string_arg_values(call_expr, message_idx).is_empty();
+                !extract_static_string_arg_values(call_expr, *message_idx).is_empty();
             if !call.literal_receive {
-                call.receive_reads = receive_reads(site, owner, call_expr, callback_idx);
+                let reads = receive_reads(site, owner, call_expr, *callback_idx);
+                if reads.items.is_some() || reads.opaque {
+                    call.receive_reads = Some(Box::new(reads));
+                }
             }
         }
         _ => {}
@@ -1015,9 +1037,13 @@ fn op_items(
         }
     }
     let fact = site.call(&call_expr);
+    let has_role = matches!(
+        &fact,
+        Some(crate::db_index::NetCallLookup::Full(fact)) if fact.role.is_some()
+    );
     // A parameter holds whatever function the caller passes, so its call is
     // bound per call site rather than to one statically resolved body.
-    if fact.as_ref().is_none_or(|fact| fact.role.is_none())
+    if !has_role
         && let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
         && let Some(param) = param_ref(site, owner, &name_expr)
     {
@@ -1025,7 +1051,7 @@ fn op_items(
             ParamRef::Own(idx) => NetOpItem::Param {
                 idx,
                 dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
-                flow_path: extract_flow_path(site.file_id, block, &call_expr),
+                flow_path: extract_flow_path(site.file_id, block, &call_expr).into_boxed_slice(),
             },
             ParamRef::Other => NetOpItem::Opaque,
         });
@@ -1036,32 +1062,44 @@ fn op_items(
     };
     // A call the metadata recognizes as a net op is a leaf: it never doubles as
     // a helper to expand into.
-    match &fact.role {
-        Some(NetCallRole::Payload(op)) => out.push(NetOpItem::Op(NetOpEntry {
-            op: op.clone(),
-            display_name: call_display_name(&call_expr),
-            file_id: site.file_id,
-            range: call_expr.get_range(),
-            dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
-            bits: fact
-                .bits_param_idx
-                .and_then(|arg_idx| extract_bit_width_arg(&call_expr, arg_idx)),
-            has_bits_param: fact.bits_param_idx.is_some(),
-            value_text: extract_write_value_text(&call_expr, op),
-            flow_path: extract_flow_path(site.file_id, block, &call_expr),
-        })),
-        Some(_) => {}
-        None => {
-            if let Some(target) = &fact.target {
-                out.push(NetOpItem::Helper {
-                    target: target.clone(),
-                    dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
-                    flow_path: extract_flow_path(site.file_id, block, &call_expr),
-                    fn_args: call_fn_args(site, owner, &call_expr),
-                    colon_call: call_expr.is_colon_call(),
-                });
-            }
+    match fact {
+        crate::db_index::NetCallLookup::TargetOnly(target) => {
+            out.push(NetOpItem::Helper {
+                target,
+                dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
+                flow_path: extract_flow_path(site.file_id, block, &call_expr).into_boxed_slice(),
+                fn_args: call_fn_args(site, owner, &call_expr).into_boxed_slice(),
+                colon_call: call_expr.is_colon_call(),
+            });
         }
+        crate::db_index::NetCallLookup::Full(fact) => match &fact.role {
+            Some(NetCallRole::Payload(op)) => out.push(NetOpItem::Op(Box::new(NetOpEntry {
+                op: op.clone(),
+                display_name: call_display_name(&call_expr),
+                file_id: site.file_id,
+                range: call_expr.get_range(),
+                dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
+                bits: fact
+                    .bits_param_idx
+                    .and_then(|arg_idx| extract_bit_width_arg(&call_expr, arg_idx)),
+                has_bits_param: fact.bits_param_idx.is_some(),
+                value_text: extract_write_value_text(&call_expr, op),
+                flow_path: extract_flow_path(site.file_id, block, &call_expr),
+            }))),
+            Some(_) => {}
+            None => {
+                if let Some(target) = &fact.target {
+                    out.push(NetOpItem::Helper {
+                        target: target.clone(),
+                        dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
+                        flow_path: extract_flow_path(site.file_id, block, &call_expr)
+                            .into_boxed_slice(),
+                        fn_args: call_fn_args(site, owner, &call_expr).into_boxed_slice(),
+                        colon_call: call_expr.is_colon_call(),
+                    });
+                }
+            }
+        },
     }
 }
 
@@ -1156,7 +1194,7 @@ fn receive_reads(
                 items: Some(vec![NetOpItem::Param {
                     idx,
                     dynamic: false,
-                    flow_path: Vec::new(),
+                    flow_path: Box::default(),
                 }]),
                 opaque: false,
             },
@@ -1376,7 +1414,10 @@ pub(crate) fn evaluate_net_flows(
 /// the sends of the helper it calls.
 fn collect_call_flows(ctx: &mut NetCollectCtx<'_>, call_expr: &LuaCallExpr) -> CallFlows {
     let mut flows = CallFlows::default();
-    let candidate = ctx.site.call(call_expr).is_some_and(|fact| fact.candidate);
+    let candidate = matches!(
+        ctx.site.call(call_expr),
+        Some(crate::db_index::NetCallLookup::Full(fact)) if fact.candidate
+    );
     if candidate {
         let receive_flows = collect_net_receive_flows(ctx, call_expr);
         if !receive_flows.is_empty() {
@@ -1859,7 +1900,7 @@ fn collect_start_messages(
     active_helpers.push(state_key.0.clone());
     let helper = ctx.helper(&state_key.0);
     for call in helper.calls.iter().filter(|call| !call.nested) {
-        match &call.role {
+        match call.role.as_deref() {
             Some(NetCallRole::Start { message_idx }) => {
                 if let Some(message) = resolve_arg(&call.args, *message_idx, &bindings) {
                     messages.push(message);
@@ -2328,7 +2369,7 @@ fn helper_receive_body(
         let mut direct = Vec::new();
         let mut edges = Vec::new();
         for call in helper.calls.iter().filter(|call| !call.nested) {
-            match &call.role {
+            match call.role.as_deref() {
                 Some(NetCallRole::Receive { message_idx, .. }) => {
                     if call.literal_receive {
                         continue;
@@ -2337,8 +2378,9 @@ fn helper_receive_body(
                     else {
                         continue;
                     };
-                    let (reads, reads_opaque) =
-                        compose_receive_reads(ctx, &call.receive_reads, &state_key.2);
+                    let default_reads = NetReceiveReads::default();
+                    let reads = call.receive_reads.as_deref().unwrap_or(&default_reads);
+                    let (reads, reads_opaque) = compose_receive_reads(ctx, reads, &state_key.2);
                     direct.push(CachedReceiveBody {
                         message_name,
                         reads,
@@ -2546,7 +2588,7 @@ fn compose_ops(
     let mut composed = Vec::new();
     for item in items {
         match item {
-            NetOpItem::Op(entry) => composed.push(ComposedOp::Op(entry.clone())),
+            NetOpItem::Op(entry) => composed.push(ComposedOp::Op((**entry).clone())),
             NetOpItem::Opaque => composed.push(ComposedOp::Opaque),
             NetOpItem::Param {
                 idx,
@@ -2711,7 +2753,7 @@ fn reach_walk(db: &DbIndex, helper_id: &HelperId) -> NetReach {
     while let Some(id) = open.pop() {
         let helper = helper_summary(db, &id);
         for call in &helper.calls {
-            reach = reach.union(NetReach::of_role(call.role.as_ref()));
+            reach = reach.union(NetReach::of_role(call.role.as_deref()));
         }
         // A function its caller passes may write anything.
         reach.payload |= helper
@@ -2749,9 +2791,9 @@ fn send_walk(db: &DbIndex, helper_id: &HelperId) -> Option<HelperSendAnswer> {
         }
         let helper = helper_summary(db, helper_id);
         for call in helper.calls.iter().filter(|call| !call.nested) {
-            match &call.role {
+            match call.role.as_deref() {
                 Some(NetCallRole::Send(send_kind)) => {
-                    sends.push((*send_kind, call.send_target.clone()));
+                    sends.push((*send_kind, call.send_target.as_deref().map(str::to_owned)));
                 }
                 Some(_) => {}
                 None => {
@@ -2942,7 +2984,7 @@ fn expand_helper_body(
     let mut walk = Vec::new();
     for item in &helper.ops {
         match item {
-            NetOpItem::Op(entry) => walk.push(ComposedOp::Op(entry.clone())),
+            NetOpItem::Op(entry) => walk.push(ComposedOp::Op((**entry).clone())),
             NetOpItem::Param {
                 idx,
                 dynamic,
@@ -2950,7 +2992,7 @@ fn expand_helper_body(
             } => walk.push(ComposedOp::Param {
                 idx: *idx,
                 dynamic: *dynamic,
-                flow_path: flow_path.clone(),
+                flow_path: flow_path.to_vec(),
             }),
             NetOpItem::Opaque => walk.push(ComposedOp::Opaque),
             NetOpItem::Helper {

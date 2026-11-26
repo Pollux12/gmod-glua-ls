@@ -725,8 +725,8 @@ fn collect_call_site_param_types(
             Some(LuaCallTarget {
                 declared: Some(signature_id),
                 ..
-            }) => signature_ids.push(*signature_id),
-            Some(target) => signature_ids.clone_from(&target.inferred),
+            }) => signature_ids.push(signature_id),
+            Some(target) => signature_ids = target.inferred,
             None => {}
         }
     }
@@ -1530,13 +1530,13 @@ fn signature_ids_from_call_prefix(
         && is_local_callee
         && is_unwritten_alias(db, file_id, name_expr, call_position)
         && let Some(signature_id) = super::call_target::call_target_of(db, file_id, call_expr)
-            .and_then(LuaCallTarget::signature_id)
+            .and_then(|target| target.signature_id())
     {
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
     let mut signature_ids = super::call_target::call_target_of(db, file_id, call_expr)
-        .map(|target| target.inferred.clone())
+        .map(|target| target.inferred)
         .unwrap_or_default();
     let mut lookup_kind = SignatureLookupKind::InferredCallable;
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
