@@ -13,44 +13,188 @@ pub type KeyIdx = u32;
 /// A derivation's slot in [`ReaderGraph::derivations`].
 type DerivIdx = u32;
 
-/// What one derivation's last evaluation read and wrote, as sorted key slots.
+#[inline]
+fn encode_varint(mut v: u32, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+#[inline]
+fn encode_varint_buf(mut v: u32, buf: &mut [u8; 5]) -> usize {
+    let mut n = 0;
+    while v >= 0x80 {
+        buf[n] = (v as u8) | 0x80;
+        v >>= 7;
+        n += 1;
+    }
+    buf[n] = v as u8;
+    n + 1
+}
+
+fn encode_sorted(vals: impl Iterator<Item = u32>, out: &mut Vec<u8>) -> u32 {
+    let mut prev = 0u32;
+    let mut count = 0u32;
+    for v in vals {
+        debug_assert!(count == 0 || v >= prev, "delta-varint input must be sorted");
+        encode_varint(v - prev, out);
+        prev = v;
+        count += 1;
+    }
+    count
+}
+
+#[derive(Debug, Clone)]
+struct DeltaVarintIter<'a> {
+    bytes: &'a [u8],
+    prev: u32,
+    remaining: u32,
+}
+
+impl<'a> DeltaVarintIter<'a> {
+    fn new(bytes: &'a [u8], count: u32) -> Self {
+        Self {
+            bytes,
+            prev: 0,
+            remaining: count,
+        }
+    }
+
+    fn known_len(&self) -> Option<usize> {
+        (self.remaining != u32::MAX).then_some(self.remaining as usize)
+    }
+
+    fn contains(mut self, target: u32) -> bool {
+        while let Some(v) = self.next() {
+            if v >= target {
+                return v == target;
+            }
+        }
+        false
+    }
+}
+
+impl Iterator for DeltaVarintIter<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        let bytes = self.bytes;
+        if bytes.is_empty() {
+            return None;
+        }
+        let b0 = bytes[0];
+        if b0 < 0x80 {
+            self.bytes = &bytes[1..];
+            self.prev = self.prev.wrapping_add(u32::from(b0));
+            if self.remaining != u32::MAX && self.remaining > 0 {
+                self.remaining -= 1;
+            }
+            return Some(self.prev);
+        }
+        let mut delta = u32::from(b0 & 0x7f);
+        let mut shift = 7u32;
+        let mut i = 1usize;
+        loop {
+            let b = bytes[i];
+            i += 1;
+            delta |= u32::from(b & 0x7f) << shift;
+            if b < 0x80 {
+                break;
+            }
+            shift += 7;
+        }
+        self.bytes = &bytes[i..];
+        self.prev = self.prev.wrapping_add(delta);
+        if self.remaining != u32::MAX && self.remaining > 0 {
+            self.remaining -= 1;
+        }
+        Some(self.prev)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.remaining != u32::MAX {
+            let n = self.remaining as usize;
+            (n, Some(n))
+        } else {
+            (0, Some(self.bytes.len()))
+        }
+    }
+}
+
+/// What one derivation's last evaluation read and wrote, as sorted key slots
+/// stored delta-varint encoded in one compact byte slice.
 /// The fingerprint a read saw is the reader group the derivation sits in on
 /// the key ([`Readers`]).
 #[derive(Debug, Clone, Default)]
 struct Record {
-    /// The reads, then the outputs.
-    keys: Box<[KeyIdx]>,
-    reads: u32,
+    /// Delta-varint encoded sorted reads, followed by delta-varint encoded sorted outputs.
+    bytes: Box<[u8]>,
+    reads_bytes: u32,
+    read_count: u32,
 }
 
 impl Record {
     fn new(reads: impl ExactSizeIterator<Item = KeyIdx>, outputs: &[KeyIdx]) -> Self {
-        let read_count = u32::try_from(reads.len()).expect("fewer than 2^32 reads");
-        let mut keys = Vec::with_capacity(reads.len() + outputs.len());
-        keys.extend(reads);
-        keys.extend_from_slice(outputs);
+        let mut bytes = Vec::with_capacity((reads.len() + outputs.len()) * 2);
+        let read_count = encode_sorted(reads, &mut bytes);
+        let reads_bytes = u32::try_from(bytes.len()).expect("fewer than 2^32 record read bytes");
+        encode_sorted(outputs.iter().copied(), &mut bytes);
         Self {
-            keys: keys.into_boxed_slice(),
-            reads: read_count,
+            bytes: bytes.into_boxed_slice(),
+            reads_bytes,
+            read_count,
         }
     }
 
-    fn reads(&self) -> &[KeyIdx] {
-        &self.keys[..self.reads as usize]
+    fn reads(&self) -> DeltaVarintIter<'_> {
+        DeltaVarintIter::new(&self.bytes[..self.reads_bytes as usize], self.read_count)
     }
 
-    fn outputs(&self) -> &[KeyIdx] {
-        &self.keys[self.reads as usize..]
+    fn reads_len(&self) -> usize {
+        self.read_count as usize
+    }
+
+    fn outputs(&self) -> DeltaVarintIter<'_> {
+        DeltaVarintIter::new(&self.bytes[self.reads_bytes as usize..], u32::MAX)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[cfg(test)]
+    fn bytes_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
     }
 
     /// This record with `reads` in place of its reads.
     fn with_reads(&self, reads: &[KeyIdx]) -> Self {
-        Self::new(reads.iter().copied(), self.outputs())
+        let old_outputs = &self.bytes[self.reads_bytes as usize..];
+        let mut bytes = Vec::with_capacity(reads.len() * 2 + old_outputs.len());
+        let read_count = encode_sorted(reads.iter().copied(), &mut bytes);
+        let reads_bytes = u32::try_from(bytes.len()).expect("fewer than 2^32 record read bytes");
+        bytes.extend_from_slice(old_outputs);
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            reads_bytes,
+            read_count,
+        }
     }
 
     /// This record with `outputs` in place of its outputs.
     fn with_outputs(&self, outputs: &[KeyIdx]) -> Self {
-        Self::new(self.reads().iter().copied(), outputs)
+        let old_reads = &self.bytes[..self.reads_bytes as usize];
+        let mut bytes = Vec::with_capacity(old_reads.len() + outputs.len() * 2);
+        bytes.extend_from_slice(old_reads);
+        encode_sorted(outputs.iter().copied(), &mut bytes);
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            reads_bytes: self.reads_bytes,
+            read_count: self.read_count,
+        }
     }
 }
 
@@ -230,6 +374,304 @@ mod query_presence_tests {
     }
 }
 
+/// Single-allocation delta-varint reader group: header followed inline by
+/// `cap` bytes of delta-varint encoded sorted `DerivIdx`s.
+#[repr(C)]
+struct GroupHeader {
+    seen: Fingerprint,
+    last: DerivIdx,
+    count: u32,
+    len: u32,
+    cap: u32,
+}
+
+struct CompactGroup(std::ptr::NonNull<GroupHeader>);
+
+// SAFETY: `CompactGroup` exclusively owns its heap allocation with no interior
+// mutability, identical to `Box<T>`.
+unsafe impl Send for CompactGroup {}
+unsafe impl Sync for CompactGroup {}
+
+impl CompactGroup {
+    #[inline]
+    fn layout(cap: u32) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(
+            std::mem::size_of::<GroupHeader>() + cap as usize,
+            std::mem::align_of::<GroupHeader>(),
+        )
+        .expect("valid CompactGroup layout")
+    }
+
+    #[inline]
+    fn header(&self) -> &GroupHeader {
+        // SAFETY: `self.0` always points to an initialized `GroupHeader`.
+        unsafe { self.0.as_ref() }
+    }
+
+    #[inline]
+    fn header_mut(&mut self) -> &mut GroupHeader {
+        // SAFETY: `&mut self` grants exclusive access to the allocation.
+        unsafe { self.0.as_mut() }
+    }
+
+    #[inline]
+    fn data(&self) -> &[u8] {
+        let len = self.header().len as usize;
+        // SAFETY: `len <= cap` bytes follow `GroupHeader` in the same allocation.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().add(1) as *const u8, len) }
+    }
+
+    fn alloc_raw(seen: Fingerprint, last: DerivIdx, count: u32, bytes: &[u8]) -> Self {
+        let len = u32::try_from(bytes.len()).expect("CompactGroup len fits in u32");
+        let layout = Self::layout(len);
+        // SAFETY: `layout.size() >= size_of::<GroupHeader>() > 0`.
+        let raw = unsafe { std::alloc::alloc(layout) } as *mut GroupHeader;
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: `ptr` is valid for `GroupHeader` + `len` bytes.
+        unsafe {
+            ptr.as_ptr().write(GroupHeader {
+                seen,
+                last,
+                count,
+                len,
+                cap: len,
+            });
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    ptr.as_ptr().add(1) as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+        Self(ptr)
+    }
+
+    fn from_sorted(seen: Fingerprint, derivs: &[DerivIdx]) -> Self {
+        let mut bytes = Vec::with_capacity(derivs.len() * 2);
+        let count = encode_sorted(derivs.iter().copied(), &mut bytes);
+        let last = derivs.last().copied().unwrap_or(0);
+        Self::alloc_raw(seen, last, count, &bytes)
+    }
+
+    fn ensure_cap(&mut self, needed: u32) {
+        let cap = self.header().cap;
+        if needed <= cap {
+            return;
+        }
+        let new_cap = cap.saturating_add(cap / 2).max(needed).max(8);
+        let old_layout = Self::layout(cap);
+        let new_size = std::mem::size_of::<GroupHeader>() + new_cap as usize;
+        // SAFETY: `self.0` was allocated with `old_layout`, `new_size > 0`.
+        let raw = unsafe { std::alloc::realloc(self.0.as_ptr() as *mut u8, old_layout, new_size) }
+            as *mut GroupHeader;
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(Self::layout(new_cap));
+        };
+        self.0 = ptr;
+        self.header_mut().cap = new_cap;
+    }
+
+    fn seen(&self) -> Fingerprint {
+        self.header().seen
+    }
+
+    fn set_seen(&mut self, seen: Fingerprint) {
+        self.header_mut().seen = seen;
+    }
+
+    fn len(&self) -> usize {
+        self.header().count as usize
+    }
+
+    fn iter(&self) -> DeltaVarintIter<'_> {
+        DeltaVarintIter::new(self.data(), self.header().count)
+    }
+
+    fn contains(&self, deriv: DerivIdx) -> bool {
+        let h = self.header();
+        if h.count == 0 || deriv > h.last {
+            return false;
+        }
+        if deriv == h.last {
+            return true;
+        }
+        self.iter().contains(deriv)
+    }
+
+    fn insert(&mut self, deriv: DerivIdx) {
+        let h = self.header();
+        if h.count == 0 || deriv > h.last {
+            let delta = if h.count == 0 { deriv } else { deriv - h.last };
+            let mut buf = [0u8; 5];
+            let n = encode_varint_buf(delta, &mut buf);
+            let old_len = h.len;
+            let new_len = old_len + n as u32;
+            self.ensure_cap(new_len);
+            // SAFETY: `new_len <= cap` bytes follow `GroupHeader`.
+            unsafe {
+                let dst = (self.0.as_ptr().add(1) as *mut u8).add(old_len as usize);
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
+            }
+            let h = self.header_mut();
+            h.len = new_len;
+            h.last = deriv;
+            h.count += 1;
+            return;
+        }
+        if deriv == h.last {
+            return;
+        }
+        let mut derivs = self.to_vec();
+        if let Err(at) = derivs.binary_search(&deriv) {
+            derivs.insert(at, deriv);
+            self.replace_sorted(&derivs);
+        }
+    }
+
+    fn remove(&mut self, deriv: DerivIdx) -> bool {
+        let h = self.header();
+        if h.count == 0 || deriv > h.last {
+            return false;
+        }
+        let mut derivs = self.to_vec();
+        if let Ok(at) = derivs.binary_search(&deriv) {
+            derivs.remove(at);
+            self.replace_sorted(&derivs);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn replace_sorted(&mut self, derivs: &[DerivIdx]) {
+        let mut bytes = Vec::with_capacity(derivs.len() * 2);
+        let count = encode_sorted(derivs.iter().copied(), &mut bytes);
+        let len = u32::try_from(bytes.len()).expect("CompactGroup len fits in u32");
+        self.ensure_cap(len);
+        // SAFETY: `len <= cap` bytes follow `GroupHeader`.
+        unsafe {
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.0.as_ptr().add(1) as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+        let h = self.header_mut();
+        h.last = derivs.last().copied().unwrap_or(0);
+        h.count = count;
+        h.len = len;
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let h = self.header();
+        if h.len >= h.cap {
+            return;
+        }
+        let old_layout = Self::layout(h.cap);
+        let new_len = h.len;
+        let new_size = std::mem::size_of::<GroupHeader>() + new_len as usize;
+        // SAFETY: `self.0` was allocated with `old_layout`, `new_size >= size_of::<GroupHeader>() > 0`.
+        let raw = unsafe { std::alloc::realloc(self.0.as_ptr() as *mut u8, old_layout, new_size) }
+            as *mut GroupHeader;
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(Self::layout(new_len));
+        };
+        self.0 = ptr;
+        self.header_mut().cap = new_len;
+    }
+
+    fn to_vec(&self) -> Vec<DerivIdx> {
+        let mut out = Vec::with_capacity(self.len());
+        out.extend(self.iter());
+        out
+    }
+
+    fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<GroupHeader>() + self.header().cap as usize
+    }
+}
+
+impl Clone for CompactGroup {
+    fn clone(&self) -> Self {
+        let h = self.header();
+        Self::alloc_raw(h.seen, h.last, h.count, self.data())
+    }
+}
+
+impl Drop for CompactGroup {
+    fn drop(&mut self) {
+        let layout = Self::layout(self.header().cap);
+        // SAFETY: `self.0` was allocated with `layout`.
+        unsafe { std::alloc::dealloc(self.0.as_ptr() as *mut u8, layout) };
+    }
+}
+
+impl std::fmt::Debug for CompactGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CompactGroup")
+            .field(&self.seen())
+            .field(&self.to_vec())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+enum GroupReaders<'a> {
+    Slice(&'a [DerivIdx]),
+    Compact(DeltaVarintIter<'a>),
+}
+
+impl<'a> GroupReaders<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(slice) => slice.len(),
+            Self::Compact(iter) => iter.known_len().unwrap_or(0),
+        }
+    }
+
+    fn contains(&self, deriv: DerivIdx) -> bool {
+        match self {
+            Self::Slice(slice) => slice.binary_search(&deriv).is_ok(),
+            Self::Compact(iter) => iter.clone().contains(deriv),
+        }
+    }
+
+    fn iter(&self) -> GroupReadersIter<'a> {
+        match self {
+            Self::Slice(slice) => GroupReadersIter::Slice(slice.iter()),
+            Self::Compact(iter) => GroupReadersIter::Compact(iter.clone()),
+        }
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<DerivIdx> {
+        self.iter().collect()
+    }
+}
+
+#[derive(Clone)]
+enum GroupReadersIter<'a> {
+    Slice(std::slice::Iter<'a, DerivIdx>),
+    Compact(DeltaVarintIter<'a>),
+}
+
+impl Iterator for GroupReadersIter<'_> {
+    type Item = DerivIdx;
+
+    #[inline]
+    fn next(&mut self) -> Option<DerivIdx> {
+        match self {
+            Self::Slice(iter) => iter.next().copied(),
+            Self::Compact(iter) => iter.next(),
+        }
+    }
+}
+
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.
 /// A derivation reads a key at one value, so it is in one group. Nearly every
 /// key has one group, so checking its readers against a new value is one
@@ -241,7 +683,7 @@ enum Readers {
     None,
     One(Fingerprint, DerivIdx),
     /// Two or more readers.
-    Group(Box<(Fingerprint, Vec<DerivIdx>)>),
+    Group(CompactGroup),
     /// Two or more groups.
     Groups(Box<Vec<(Fingerprint, Vec<DerivIdx>)>>),
 }
@@ -256,17 +698,14 @@ impl Readers {
             Self::One(group, reader) if *reader == deriv => *group = seen,
             Self::One(group, reader) if *group == seen => {
                 let pair = if *reader < deriv {
-                    vec![*reader, deriv]
+                    [*reader, deriv]
                 } else {
-                    vec![deriv, *reader]
+                    [deriv, *reader]
                 };
-                *self = Self::Group(Box::new((seen, pair)));
+                *self = Self::Group(CompactGroup::from_sorted(seen, &pair));
             }
-            Self::Group(group) if group.0 == seen => {
-                if let Err(at) = group.1.binary_search(&deriv) {
-                    reserve_readers(&mut group.1, 1);
-                    group.1.insert(at, deriv);
-                }
+            Self::Group(group) if group.seen() == seen => {
+                group.insert(deriv);
             }
             Self::Groups(groups) => {
                 for (group, derivs) in groups.iter_mut() {
@@ -288,9 +727,9 @@ impl Readers {
                 *self = Self::Groups(Box::new(vec![(*group, vec![*reader]), (seen, vec![deriv])]));
             }
             Self::Group(group) => {
-                take_from(&mut group.1, deriv);
-                let prev_seen = group.0;
-                let derivs = std::mem::take(&mut group.1);
+                group.remove(deriv);
+                let prev_seen = group.seen();
+                let derivs = group.to_vec();
                 *self = Self::Groups(Box::new(vec![(prev_seen, derivs), (seen, vec![deriv])]));
                 self.collapse();
             }
@@ -306,9 +745,15 @@ impl Readers {
                 }
             }
             Self::Group(group) => {
-                take_from(&mut group.1, deriv);
-                if let [reader] = group.1.as_slice() {
-                    *self = Self::One(group.0, *reader);
+                if group.remove(deriv) {
+                    match group.len() {
+                        0 => *self = Self::None,
+                        1 => {
+                            let reader = group.iter().next().expect("single reader");
+                            *self = Self::One(group.seen(), reader);
+                        }
+                        _ => {}
+                    }
                 }
             }
             Self::Groups(groups) => {
@@ -328,12 +773,12 @@ impl Readers {
                 *seen
             }
             Self::Group(group) => {
-                debug_assert!(group.1.binary_search(&deriv).is_ok());
-                group.0
+                debug_assert!(group.contains(deriv));
+                group.seen()
             }
             _ => self
                 .groups()
-                .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
+                .find(|(_, derivs)| derivs.contains(deriv))
                 .map(|(seen, _)| seen)
                 .expect("a recorded read is filed among the key's readers"),
         }
@@ -349,8 +794,8 @@ impl Readers {
                 }
             }
             Self::Group(group) => {
-                if group.0 == from {
-                    group.0 = to;
+                if group.seen() == from {
+                    group.set_seen(to);
                 }
             }
             Self::Groups(groups) => {
@@ -377,7 +822,7 @@ impl Readers {
         match self {
             Self::None | Self::One(..) => {}
             Self::Group(group) => {
-                group.1.shrink_to_fit();
+                group.shrink_to_fit();
             }
             Self::Groups(groups) => {
                 for (_, derivs) in groups.iter_mut() {
@@ -452,7 +897,7 @@ impl Readers {
         let mut groups = match std::mem::take(self) {
             Self::None => Vec::new(),
             Self::One(seen, reader) => vec![(seen, vec![reader])],
-            Self::Group(group) => vec![*group],
+            Self::Group(group) => vec![(group.seen(), group.to_vec())],
             Self::Groups(groups) => *groups,
         };
         let of = |moved: &[(Fingerprint, DerivIdx)], seen: Fingerprint| {
@@ -483,9 +928,15 @@ impl Readers {
 
     /// The group `deriv` reads in, if it is a reader.
     fn group_of(&self, deriv: DerivIdx) -> Option<Fingerprint> {
-        self.groups()
-            .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
-            .map(|(seen, _)| seen)
+        match self {
+            Self::None => None,
+            Self::One(seen, reader) => (*reader == deriv).then_some(*seen),
+            Self::Group(group) => group.contains(deriv).then_some(group.seen()),
+            Self::Groups(groups) => groups
+                .iter()
+                .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
+                .map(|(seen, _)| *seen),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -493,21 +944,28 @@ impl Readers {
     }
 
     /// Each group's fingerprint and its readers.
-    fn groups(&self) -> impl Iterator<Item = (Fingerprint, &[DerivIdx])> {
+    fn groups(&self) -> impl Iterator<Item = (Fingerprint, GroupReaders<'_>)> {
         let (single, many) = match self {
             Self::None => (None, &[][..]),
-            Self::One(seen, reader) => (Some((*seen, std::slice::from_ref(reader))), &[][..]),
-            Self::Group(group) => (Some((group.0, group.1.as_slice())), &[][..]),
+            Self::One(seen, reader) => (
+                Some((*seen, GroupReaders::Slice(std::slice::from_ref(reader)))),
+                &[][..],
+            ),
+            Self::Group(group) => (
+                Some((group.seen(), GroupReaders::Compact(group.iter()))),
+                &[][..],
+            ),
             Self::Groups(groups) => (None, groups.as_slice()),
         };
-        single
-            .into_iter()
-            .chain(many.iter().map(|(seen, derivs)| (*seen, derivs.as_slice())))
+        single.into_iter().chain(
+            many.iter()
+                .map(|(seen, derivs)| (*seen, GroupReaders::Slice(derivs.as_slice()))),
+        )
     }
 
     fn iter(&self) -> impl Iterator<Item = (Fingerprint, DerivIdx)> + '_ {
         self.groups()
-            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (seen, *deriv)))
+            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (seen, deriv)))
     }
 
     /// The heap bytes of the group list and of the reader lists.
@@ -515,10 +973,7 @@ impl Readers {
         let list = |derivs: &Vec<DerivIdx>| derivs.capacity() * std::mem::size_of::<DerivIdx>();
         match self {
             Self::None | Self::One(..) => (0, 0),
-            Self::Group(group) => (
-                std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
-                list(&group.1),
-            ),
+            Self::Group(group) => (0, group.heap_bytes()),
             Self::Groups(groups) => (
                 std::mem::size_of::<Vec<(Fingerprint, Vec<DerivIdx>)>>()
                     + groups.capacity() * std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
@@ -540,7 +995,7 @@ impl Readers {
             None => Self::None,
             Some((seen, derivs)) => match derivs.as_slice() {
                 [reader] => Self::One(seen, *reader),
-                _ => Self::Group(Box::new((seen, derivs))),
+                _ => Self::Group(CompactGroup::from_sorted(seen, &derivs)),
             },
         };
     }
@@ -548,11 +1003,11 @@ impl Readers {
 
 /// The sorted `reads` with each source of `moves`, sorted by source, replaced
 /// by its target, sorted and without repeats.
-fn renamed_slots(reads: &[KeyIdx], moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> {
-    let mut kept = Vec::with_capacity(reads.len());
+fn renamed_slots(reads: DeltaVarintIter<'_>, moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> {
+    let mut kept = Vec::with_capacity(reads.known_len().unwrap_or(0));
     let mut renamed = Vec::with_capacity(moves.len());
     let mut next = 0;
-    for &read in reads {
+    for read in reads {
         while next < moves.len() && moves[next].0 < read {
             next += 1;
         }
@@ -1354,19 +1809,19 @@ impl ReaderGraph {
             .values()
             .map(|more| more.capacity() * size_of::<DerivIdx>())
             .sum::<usize>();
-        let (reads, outputs) = self
+        let (reads, outputs, records) = self
             .derivations
             .iter()
             .filter_map(|slot| slot.record.as_ref())
-            .fold((0, 0), |(reads, outputs), record| {
+            .fold((0, 0, 0), |(reads, outputs, bytes), record| {
                 (
-                    reads + record.reads().len(),
-                    outputs + record.outputs().len(),
+                    reads + record.reads_len(),
+                    outputs + record.outputs().count(),
+                    bytes + record.heap_bytes(),
                 )
             });
         let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<FiledKey>());
         let key_slots = table.keys.capacity() * size_of::<KeySlot>();
-        let records = (reads + outputs) * size_of::<KeyIdx>();
         let derivation_maps = hash_table_bytes(self.deriv_slots.capacity(), size_of::<DerivIdx>())
             + self.derivations.capacity() * size_of::<DerivSlot>();
         let total = key_map
@@ -1900,8 +2355,8 @@ impl ReaderGraph {
                 self.derivations[*deriv as usize]
                     .record
                     .iter()
-                    .flat_map(|record| record.reads().iter())
-                    .map(|key| (*key, *deriv))
+                    .flat_map(|record| record.reads())
+                    .map(|key| (key, *deriv))
             })
             .collect::<Vec<_>>();
         leaving.par_sort_unstable();
@@ -1961,7 +2416,7 @@ impl ReaderGraph {
             .flatten()
             .filter(move |(seen, _)| !holds(*seen))
             .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (deriv, seen)))
-            .map(|(deriv, seen)| (self.derivations[*deriv as usize].id, seen))
+            .map(|(deriv, seen)| (self.derivations[deriv as usize].id, seen))
     }
 
     /// Takes, on worker threads, the fingerprint of every key the records of
@@ -1974,7 +2429,7 @@ impl ReaderGraph {
     ) {
         let slots = ids
             .filter_map(|id| self.record(id))
-            .flat_map(|(_, record)| record.reads().iter().copied())
+            .flat_map(|(_, record)| record.reads())
             .collect();
         self.warm_slots(slots, fingerprint);
     }
@@ -2005,10 +2460,9 @@ impl ReaderGraph {
         let Some((deriv, record)) = self.record(id) else {
             return true;
         };
-        record.reads().iter().any(|slot| {
-            let seen = self.seen(*slot, deriv);
-            seen != self.slot_fingerprint(*slot, &fingerprint)
-                && !holds_moved(self.key(*slot), seen)
+        record.reads().any(|slot| {
+            let seen = self.seen(slot, deriv);
+            seen != self.slot_fingerprint(slot, &fingerprint) && !holds_moved(self.key(slot), seen)
         })
     }
 
@@ -2018,8 +2472,7 @@ impl ReaderGraph {
             .map(|(deriv, record)| {
                 record
                     .reads()
-                    .iter()
-                    .map(|slot| (*slot, self.seen(*slot, deriv)))
+                    .map(|slot| (slot, self.seen(slot, deriv)))
                     .collect()
             })
             .unwrap_or_default()
@@ -2029,8 +2482,8 @@ impl ReaderGraph {
     pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
-            .flat_map(|(_, record)| record.reads().iter())
-            .map(|key| self.key(*key))
+            .flat_map(|(_, record)| record.reads())
+            .map(|key| self.key(key))
     }
 
     /// Each of `id`'s recorded reads whose fingerprint differs from the one
@@ -2045,16 +2498,14 @@ impl ReaderGraph {
         };
         record
             .reads()
-            .iter()
             .zip(fingerprints)
             .filter(|(slot, fingerprint)| {
-                let entry = &self.table.keys[**slot as usize];
+                let entry = &self.table.keys[*slot as usize];
                 // A stage rule a reader saw is the stage it ran at, which only
                 // a stage barrier re-runs it for.
                 entry.readers.seen_by(deriv) != *fingerprint
                     && !entry.key.as_ref().is_some_and(|key| key.is_stage_rule())
             })
-            .map(|(slot, fingerprint)| (*slot, fingerprint))
             .collect()
     }
 
@@ -2312,8 +2763,8 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 continue;
             };
-            for output in record.outputs().iter() {
-                self.mark_readers(*output, marked, &mut pending, follows);
+            for output in record.outputs() {
+                self.mark_readers(output, marked, &mut pending, follows);
             }
         }
     }
@@ -2334,12 +2785,12 @@ impl ReaderGraph {
             .map_or(&[][..], |derived| derived.slots.as_slice());
         for slot in std::iter::once(&slot).chain(derived) {
             for (_, readers) in self.table.keys[*slot as usize].readers.groups() {
-                for reader in readers {
-                    if !marked[*reader as usize]
-                        && follows(self.derivations[*reader as usize].id.kind)
+                for reader in readers.iter() {
+                    if !marked[reader as usize]
+                        && follows(self.derivations[reader as usize].id.kind)
                     {
-                        marked[*reader as usize] = true;
-                        pending.push(*reader);
+                        marked[reader as usize] = true;
+                        pending.push(reader);
                     }
                 }
             }
@@ -2390,18 +2841,18 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 return producers;
             };
-            for slot in record.reads().iter() {
-                let base_slot = &mut base_slots[*slot as usize];
+            for slot in record.reads() {
+                let base_slot = &mut base_slots[slot as usize];
                 if *base_slot == UNSEEN {
                     *base_slot = self
                         .table
-                        .key(*slot)
+                        .key(slot)
                         .base()
                         .and_then(|base| self.table.find(&HashedKey::new(base)))
                         .unwrap_or(NO_BASE);
                 }
                 let base = (*base_slot != NO_BASE).then_some(*base_slot);
-                for slot in std::iter::once(*slot).chain(base) {
+                for slot in std::iter::once(slot).chain(base) {
                     producers.extend(self.table.producers(slot).filter(|producer| {
                         *producer != deriv && downstream_of_roots[*producer as usize]
                     }));
@@ -2555,8 +3006,8 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 continue;
             };
-            for output in record.outputs().iter().filter(|slot| moved.contains(*slot)) {
-                for slot in std::iter::once(output).chain(self.table.derived_slots(*output)) {
+            for output in record.outputs().filter(|slot| moved.contains(slot)) {
+                for slot in std::iter::once(&output).chain(self.table.derived_slots(output)) {
                     for (_, reader) in self.table.keys[*slot as usize].readers.iter() {
                         if node_of.contains_key(&reader)
                             || !follows(self.derivations[reader as usize].id.kind)
@@ -2577,13 +3028,13 @@ impl ReaderGraph {
                 let Some(record) = self.derivations[*deriv as usize].record.as_ref() else {
                     continue;
                 };
-                for slot in record.reads().iter().filter(|slot| moved.contains(*slot)) {
+                for slot in record.reads().filter(|slot| moved.contains(slot)) {
                     let base = self
                         .table
-                        .key(*slot)
+                        .key(slot)
                         .base()
                         .and_then(|base| self.table.find(&HashedKey::new(base)));
-                    for slot in std::iter::once(*slot).chain(base) {
+                    for slot in std::iter::once(slot).chain(base) {
                         producers.extend(
                             self.table
                                 .producers(slot)
@@ -2700,8 +3151,8 @@ impl ReaderGraph {
     pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
-            .flat_map(|(_, record)| record.outputs().iter())
-            .map(|key| self.key(*key))
+            .flat_map(|(_, record)| record.outputs())
+            .map(|key| self.key(key))
     }
 
     pub fn producers(&self, key: &HashedKey) -> impl Iterator<Item = DerivationId> + '_ {
@@ -2957,19 +3408,18 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-        for key in record.reads().iter() {
-            if let Some(readers) = still_read.get_mut(key) {
+        for key in record.reads() {
+            if let Some(readers) = still_read.get_mut(&key) {
                 *readers -= 1;
             }
-            self.release_slots([*key], still_read);
+            self.release_slots([key], still_read);
         }
         let outputs = record
             .outputs()
-            .iter()
             .map(|key| {
-                let fact = self.key(*key).clone();
-                self.unproduce(*key, deriv, id.file_id);
-                self.release_slots([*key], still_read);
+                let fact = self.key(key).clone();
+                self.unproduce(key, deriv, id.file_id);
+                self.release_slots([key], still_read);
                 fact
             })
             .collect();
@@ -3031,10 +3481,8 @@ impl PreparedRecord {
         let old = old.unwrap_or(&none);
         let mut ops = Vec::new();
         let mut unread = Vec::new();
-        let (mut old_reads, mut new_reads) = (
-            old.reads().iter().copied().peekable(),
-            reads.iter().copied().peekable(),
-        );
+        let (mut old_reads, mut new_reads) =
+            (old.reads().peekable(), reads.iter().copied().peekable());
         loop {
             match (old_reads.peek().copied(), new_reads.peek().copied()) {
                 (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
@@ -3062,7 +3510,7 @@ impl PreparedRecord {
         let mut dropped = Vec::new();
         let mut added = Vec::new();
         merge_sorted(
-            old.outputs().iter().copied(),
+            old.outputs(),
             outputs.iter().copied(),
             |key| dropped.push(key),
             |key| added.push(key),
@@ -3812,8 +4260,7 @@ mod tests {
                 .record
                 .as_ref()
                 .expect("the record is filed")
-                .reads()
-                .as_ptr()
+                .bytes_ptr()
         };
         let filed = reads_filed(&twice);
 
@@ -3986,7 +4433,9 @@ mod tests {
                 format!(
                     "{:?} {:?}",
                     slot.id,
-                    slot.record.as_ref().map(Record::reads)
+                    slot.record
+                        .as_ref()
+                        .map(|record| record.reads().collect::<Vec<_>>())
                 )
             })
             .collect::<Vec<_>>();
@@ -4075,8 +4524,7 @@ mod tests {
             if let Some(record) = graph.derivations[deriv as usize].record.as_mut() {
                 let mut reads = record
                     .reads()
-                    .iter()
-                    .map(|key| rewrite.get(key).copied().unwrap_or(*key))
+                    .map(|key| rewrite.get(&key).copied().unwrap_or(key))
                     .collect::<Vec<_>>();
                 reads.sort_unstable();
                 reads.dedup();
