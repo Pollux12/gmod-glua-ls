@@ -381,21 +381,17 @@ impl LuaCompilation {
     /// Files what diagnostics read since the reader graph last changed, which
     /// names its slots as they stood, before anything changes it.
     fn file_diagnostic_reads(&mut self) {
-        let diagnosed = std::mem::take(
-            self.diagnosed
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        if diagnosed.is_empty() {
+        const DIAGNOSTIC_READS_BATCH: usize = 256;
+        if self
+            .diagnosed
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
             return;
         }
         let _filing = crate::profile::PhaseGuard::new("diagnostic reads");
-        let mut diagnosed = diagnosed
-            .into_iter()
-            .map(|(file_id, reads)| (DerivationId::diagnostics(file_id), reads))
-            .collect::<Vec<_>>();
-        diagnosed.sort_unstable_by_key(|(id, _)| id.file_id);
-        self.db.reader_graph_mut().file_viewed(diagnosed);
+        while self.file_some_diagnostic_reads(DIAGNOSTIC_READS_BATCH) {}
     }
 
     /// Files what the diagnostics of up to `files` files read, as

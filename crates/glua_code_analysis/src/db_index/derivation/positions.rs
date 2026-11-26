@@ -263,7 +263,7 @@ impl EditMaps {
                 super::CallRoleKey::Signature(id) => {
                     K::call_role(super::CallRoleKey::Signature(self.signature_id(*id)?))
                 }
-                _ => return None,
+                _ => key.clone(),
             },
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
@@ -287,7 +287,7 @@ impl EditMaps {
                 DynamicFieldOwner::Table(site) => {
                     K::dynamic_field(DynamicFieldOwner::Table(self.site(site)?), boxed.1.clone())
                 }
-                _ => return None,
+                _ => key.clone(),
             },
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => {
                 K::OperatorOwner(LuaOperatorOwner::Table(self.site(site)?))

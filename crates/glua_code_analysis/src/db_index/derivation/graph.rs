@@ -1395,11 +1395,13 @@ impl KeyTable {
             }
         }
         entry.key = Some(key);
-        self.stamps
-            .resize_with(self.keys.len(), SlotStamps::default);
-        let stamps = &mut self.stamps[slot as usize];
-        stamps.stamp = 0;
-        stamps.written = now;
+        if !self.stamps.is_empty() || now != 0 {
+            self.stamps
+                .resize_with(self.keys.len(), SlotStamps::default);
+            let stamps = &mut self.stamps[slot as usize];
+            stamps.stamp = 0;
+            stamps.written = now;
+        }
         if self.fp_cache_enabled {
             self.fp_cache.resize_with(self.keys.len(), FpSlot::default);
             self.fp_cache[slot as usize]
@@ -1866,13 +1868,20 @@ impl ReaderGraph {
         });
     }
 
-    /// Frees the ephemeral fingerprint cache once diagnostics have settled;
-    /// re-enabled automatically on the next reanalysis. Returns whether any
-    /// cache pages were freed.
+    /// Frees the ephemeral fingerprint cache (and stamps if no windows are open)
+    /// once diagnostics have settled; re-enabled automatically on the next
+    /// reanalysis. Returns whether any cache pages were freed.
     pub fn release_fingerprint_cache(&mut self) -> bool {
-        let had = !self.table.fp_cache.is_empty();
+        let mut had = !self.table.fp_cache.is_empty();
         self.table.fp_cache_enabled = false;
         self.table.fp_cache.clear_and_free();
+        if self.table.windows.is_empty()
+            && self.table.held.is_empty()
+            && !self.table.stamps.is_empty()
+        {
+            self.table.stamps.clear_and_free();
+            had = true;
+        }
         had
     }
 

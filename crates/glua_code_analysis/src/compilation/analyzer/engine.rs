@@ -5402,7 +5402,7 @@ const MAX_INDEX_RUNS: u16 = 16;
 /// The queued entries one worker superstep takes at most, short of a file's:
 /// its tasks' forks and recordings live until it installs them, so this
 /// bounds what it holds.
-const SUPERSTEP_ENTRIES: usize = 32_768;
+const SUPERSTEP_ENTRIES: usize = 8_192;
 
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.

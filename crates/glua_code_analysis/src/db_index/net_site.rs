@@ -60,10 +60,7 @@ impl StoredNetCall {
 }
 
 fn target_only_fingerprint(own: FileId, target: &InFiled<TextRange>) -> Fingerprint {
-    derivation::in_file(Some(own), || {
-        derivation::fingerprint_of(&(0u8, target.file_id, derivation::Local(&target.value)))
-    })
-    .max(1)
+    derivation::in_file(Some(own), || derivation::fingerprint_of(&(0u8, target))).max(1)
 }
 
 /// What a net site describes.
