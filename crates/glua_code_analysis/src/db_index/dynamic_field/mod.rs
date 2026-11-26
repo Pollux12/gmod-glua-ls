@@ -296,8 +296,9 @@ impl SiteContributions {
                 match data.named.len() {
                     0 => *self = Self::Empty,
                     1 => {
-                        let (owner, name, range) = data.named.pop().unwrap();
-                        *self = Self::OneNamed(owner, name, range);
+                        if let Some((owner, name, range)) = data.named.pop() {
+                            *self = Self::OneNamed(owner, name, range);
+                        }
                     }
                     _ => {}
                 }

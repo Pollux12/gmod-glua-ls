@@ -31,10 +31,6 @@ impl CompactNameSet {
         Self(items.into_boxed_slice())
     }
 
-    pub fn from_iter(items: impl IntoIterator<Item = ArcIntern<SmolStr>>) -> Self {
-        Self::from_vec(items.into_iter().collect())
-    }
-
     pub fn contains(&self, name: &ArcIntern<SmolStr>) -> bool {
         if self.0.len() <= 8 {
             self.0.iter().any(|item| item == name)
@@ -57,6 +53,12 @@ impl CompactNameSet {
 
     pub fn iter(&self) -> std::slice::Iter<'_, ArcIntern<SmolStr>> {
         self.0.iter()
+    }
+}
+
+impl FromIterator<ArcIntern<SmolStr>> for CompactNameSet {
+    fn from_iter<T: IntoIterator<Item = ArcIntern<SmolStr>>>(items: T) -> Self {
+        Self::from_vec(items.into_iter().collect())
     }
 }
 

@@ -546,7 +546,7 @@ fn table_generic_tpl_pattern_match(
                         keys.push(LuaType::IntegerConst(*i));
                     }
                     LuaMemberKey::Name(s) => {
-                        keys.push(LuaType::StringConst(s.clone().into()));
+                        keys.push(LuaType::StringConst(s.clone()));
                     }
                     _ => {}
                 };

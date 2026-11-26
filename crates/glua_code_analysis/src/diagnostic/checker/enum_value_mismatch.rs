@@ -134,7 +134,7 @@ fn get_enum_value_types(
                 let key = member.get_key();
                 match key {
                     LuaMemberKey::Name(name) => {
-                        values.push(LuaType::StringConst(name.clone().into()));
+                        values.push(LuaType::StringConst(name.clone()));
                     }
                     LuaMemberKey::Integer(i) => {
                         values.push(LuaType::IntegerConst(*i));

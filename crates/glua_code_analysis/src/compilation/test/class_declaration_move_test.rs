@@ -40,7 +40,7 @@ end
         graph
             .derivations()
             .filter(|id| id.file_id == file_id)
-            .any(|id| graph.reads_of(id).any(|read| wanted(read)))
+            .any(|id| graph.reads_of(id).any(&wanted))
     }
 
     /// Asserts `ws` has no derivation left stale and settles as a cold build

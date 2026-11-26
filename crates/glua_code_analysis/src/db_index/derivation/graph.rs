@@ -90,8 +90,8 @@ impl<'a> DeltaVarintIter<'a> {
         (self.remaining != u32::MAX).then_some(self.remaining as usize)
     }
 
-    fn contains(mut self, target: u32) -> bool {
-        while let Some(v) = self.next() {
+    fn contains(self, target: u32) -> bool {
+        for v in self {
             if v >= target {
                 return v == target;
             }
@@ -245,7 +245,7 @@ fn build_positional(keys: &Paged<KeySlot>) -> FxHashMap<FileId, FxHashSet<KeyIdx
                     .key
                     .as_ref()
                     .into_iter()
-                    .flat_map(|key| positional_files(key))
+                    .flat_map(positional_files)
                     .map(move |file_id| (file_id, slot))
             })
         })

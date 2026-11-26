@@ -75,7 +75,7 @@ mod test {
         let outputs = db
             .reader_graph()
             .outputs_of(statement)
-            .map(|key| key.clone())
+            .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
             (
