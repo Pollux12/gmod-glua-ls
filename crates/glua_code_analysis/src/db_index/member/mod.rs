@@ -257,10 +257,13 @@ pub struct LuaMemberIndex {
     /// `(owner, key)` slots whose last co-writer readmission merged nothing.
     ///
     /// See [`Self::readmit_preserved_assignment_co_writers`]: every later
-    /// scan of such a slot is a proven no-op, so marks skip the walk. Only
-    /// `clear` drops entries, with the index they describe — every other
-    /// mutation preserves the coverage they record, and any future history
-    /// write without a paired item merge must clear its slot here.
+    /// scan of such a slot is a proven no-op, so marks skip the walk. Every
+    /// mutation except removal preserves the coverage an entry records, and
+    /// any future history write without a paired item merge must clear its
+    /// slot here. A removal that empties a slot drops its entry with the
+    /// slot ([`Self::prune_reconciled_slot`]); a re-created slot re-derives
+    /// its coverage on the next mark, so an entry never outlives the slot
+    /// it describes.
     preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
@@ -2920,7 +2923,10 @@ impl LuaMemberIndex {
     /// and `set_member_owner` only through those callers), every removal
     /// touches both sides for the same id, and marking only ever covers an
     /// already-listed member. Any future history write without a paired item
-    /// merge must clear that slot's entry.
+    /// merge must clear that slot's entry. A removal that empties the slot
+    /// drops its entry ([`Self::prune_reconciled_slot`]): the coverage it
+    /// recorded left with the members, and a re-created slot is marked
+    /// fresh.
     ///
     /// Exception: [`Self::set_member_owner_only`] calls `set_member_owner`
     /// without an item merge (see the `set_member_owner_only` body), filing a
@@ -3221,6 +3227,14 @@ impl LuaMemberIndex {
         } else {
             self.note_member_home_write(member_id);
         }
+        let reconciled_slot =
+            self.member_current_owner
+                .get(&member_id)
+                .cloned()
+                .and_then(|owner| {
+                    self.get_member(&member_id)
+                        .map(|member| (owner, member.get_key().clone()))
+                });
         if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
             self.remove_member_from_all_owner_key_indexes(&owner, member_id);
             self.remove_current_owner_member(&owner, member_id);
@@ -3236,8 +3250,27 @@ impl LuaMemberIndex {
         self.note_member_object_write(member_id);
         self.deferred_index_expr_members.remove(&member_id);
         self.member_function_scope_ranges.remove(&member_id);
+        if let Some((owner, key)) = reconciled_slot {
+            self.prune_reconciled_slot(&owner, &key);
+        }
         if removed {
             self.fold_file_fingerprint(member_id.file_id, file_member_element(member_id), false);
+        }
+    }
+
+    /// Drops the reconciled-slot mark of `(owner, key)` once the slot holds
+    /// no member any more, so marks never outlive the slots they describe
+    /// under file create/delete churn.
+    ///
+    /// The mark records that a full readmission scan of the slot merged
+    /// nothing; an empty slot's scan cannot merge anything either, so
+    /// dropping it changes no answer. A slot re-created by later analysis
+    /// re-derives its coverage on the next mark, without a stale entry
+    /// there to skip it.
+    fn prune_reconciled_slot(&mut self, owner: &LuaMemberOwner, key: &LuaMemberKey) {
+        if self.history_slot_ids(owner, key).is_empty() {
+            self.preserved_co_writer_reconciled
+                .remove(&(owner.clone(), key.clone()));
         }
     }
 
