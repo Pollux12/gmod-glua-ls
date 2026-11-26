@@ -119,7 +119,7 @@ end
             "SF.SendStar<??>fall(\"download\", {}, player.GetAll())\n",
         )?;
         let caller_file = ws.def_file("lua/entities/starfall_processor/init.lua", &content);
-        let key = LuaMemberKey::Name("SendStarfall".into());
+        let key = LuaMemberKey::name("SendStarfall");
         let member_id = ws
             .analysis
             .compilation

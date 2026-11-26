@@ -1074,18 +1074,15 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     // agree on the text.
     let mut dynamic_fields = HashDump::new("dynamic_fields");
     let dynamic_field_index = db.get_dynamic_field_index();
-    for (owner, fields) in dynamic_field_index.iter_all_owner_fields() {
-        for (field_name, files) in fields {
-            let mut files = files.iter().map(|f| f.id).collect::<Vec<_>>();
+    for (owner, fields) in dynamic_field_index.iter_all_field_definitions() {
+        for (field_name, definitions) in fields {
+            let mut files = definitions.iter().map(|d| d.file_id.id).collect::<Vec<_>>();
             files.sort_unstable();
+            files.dedup();
             dynamic_fields.insert(
                 format!("OWNERFIELD {owner:?}|{field_name}"),
                 format!("{files:?}"),
             );
-        }
-    }
-    for (owner, fields) in dynamic_field_index.iter_all_field_definitions() {
-        for (field_name, definitions) in fields {
             let mut definitions = definitions
                 .iter()
                 .map(|d| format!("{d:?}"))

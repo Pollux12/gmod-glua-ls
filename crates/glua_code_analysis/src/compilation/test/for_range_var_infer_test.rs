@@ -1262,7 +1262,7 @@ RadioNum = 0
         assert!(
             t_members
                 .keys()
-                .any(|key| matches!(key, LuaMemberKey::ExprType(LuaType::Unknown))),
+                .any(|key| matches!(key, LuaMemberKey::ExprType(typ) if typ.is_unknown())),
             "expected computed-key member on T, got {:?}",
             t_members.keys().collect::<Vec<_>>()
         );

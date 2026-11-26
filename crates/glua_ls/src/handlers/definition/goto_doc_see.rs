@@ -49,7 +49,7 @@ fn goto_type_member(
     let type_id = type_decl.get_id();
     let typ = LuaType::Ref(type_id);
     let member_map = semantic_model.get_member_info_map(&typ)?;
-    let member_infos = member_map.get(&LuaMemberKey::Name(member_name.to_string().into()))?;
+    let member_infos = member_map.get(&LuaMemberKey::name(member_name.to_string()))?;
 
     let mut result = Vec::new();
     for member_info in member_infos {

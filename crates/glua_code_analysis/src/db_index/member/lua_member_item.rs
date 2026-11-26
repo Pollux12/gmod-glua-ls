@@ -17,8 +17,10 @@ use super::{LuaMemberFeature, LuaMemberId, LuaMemberOwner};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaMemberIndexItem {
     One(LuaMemberId),
-    Many(Vec<LuaMemberId>),
+    Many(Box<[LuaMemberId]>),
 }
+
+const _: () = assert!(std::mem::size_of::<LuaMemberIndexItem>() == 24);
 
 impl LuaMemberIndexItem {
     /// Keeps the ids `keep` accepts, a single one left as `One`, the shape a
@@ -27,14 +29,18 @@ impl LuaMemberIndexItem {
         match self {
             Self::One(id) => keep(*id),
             Self::Many(ids) => {
-                ids.retain(|id| keep(*id));
-                match *ids.as_slice() {
+                let mut kept = std::mem::take(ids).into_vec();
+                kept.retain(|id| keep(*id));
+                match kept.as_slice() {
                     [] => false,
                     [only] => {
-                        *self = Self::One(only);
+                        *self = Self::One(*only);
                         true
                     }
-                    _ => true,
+                    _ => {
+                        *ids = kept.into_boxed_slice();
+                        true
+                    }
                 }
             }
         }
@@ -243,10 +249,7 @@ impl LuaMemberIndexItem {
     }
 
     pub fn get_member_ids(&self) -> Vec<LuaMemberId> {
-        match self {
-            LuaMemberIndexItem::One(member_id) => vec![*member_id],
-            LuaMemberIndexItem::Many(member_ids) => member_ids.clone(),
-        }
+        self.member_ids_slice().to_vec()
     }
 
     /// The same ids borrowed: query paths that only filter and select should
@@ -1192,7 +1195,7 @@ fn resolve_member_type_with_realm(
 ) -> Result<LuaType, InferFailReason> {
     let visible_member_ids = member_item.visible_member_ids_with_realm(db, caller_file_id);
     if visible_member_ids.is_empty() {
-        return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
+        return resolve_member_type(db, &LuaMemberIndexItem::Many(Box::new([])));
     }
 
     resolve_member_type(db, &member_item_from_ids(visible_member_ids))
@@ -1205,7 +1208,7 @@ fn resolve_member_type_at_site(
 ) -> Result<LuaType, InferFailReason> {
     let visible_member_ids = member_item.visible_member_ids_at_site(db, site);
     if visible_member_ids.is_empty() {
-        return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
+        return resolve_member_type(db, &LuaMemberIndexItem::Many(Box::new([])));
     }
 
     resolve_member_type(db, &member_item_from_ids(visible_member_ids))
@@ -1596,9 +1599,9 @@ fn realm_match_rank(caller_realm: GmodRealm, member_realm: GmodRealm) -> u8 {
 
 fn member_item_from_ids(member_ids: Vec<LuaMemberId>) -> LuaMemberIndexItem {
     match member_ids.len() {
-        0 => LuaMemberIndexItem::Many(vec![]),
+        0 => LuaMemberIndexItem::Many(Box::new([])),
         1 => LuaMemberIndexItem::One(member_ids[0]),
-        _ => LuaMemberIndexItem::Many(member_ids),
+        _ => LuaMemberIndexItem::Many(member_ids.into_boxed_slice()),
     }
 }
 
@@ -2241,7 +2244,7 @@ mod tests {
             owner.clone(),
             LuaMember::new(
                 library_member,
-                LuaMemberKey::Name("value".into()),
+                LuaMemberKey::name("value"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -2250,7 +2253,7 @@ mod tests {
             owner,
             LuaMember::new(
                 other_main_member,
-                LuaMemberKey::Name("value".into()),
+                LuaMemberKey::name("value"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -2265,7 +2268,7 @@ mod tests {
             ],
         );
 
-        let item = LuaMemberIndexItem::Many(vec![other_main_member, library_member]);
+        let item = LuaMemberIndexItem::Many(Box::new([other_main_member, library_member]));
         let semantic_decl = item.resolve_semantic_decl_with_realm(&db, &caller_file);
 
         assert_eq!(
@@ -2287,7 +2290,7 @@ mod tests {
             owner.clone(),
             LuaMember::new(
                 client_member,
-                LuaMemberKey::Name("branchValue".into()),
+                LuaMemberKey::name("branchValue"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -2296,7 +2299,7 @@ mod tests {
             owner,
             LuaMember::new(
                 server_member,
-                LuaMemberKey::Name("branchValue".into()),
+                LuaMemberKey::name("branchValue"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -2343,7 +2346,7 @@ mod tests {
             .collect(),
         );
 
-        let item = LuaMemberIndexItem::Many(vec![client_member, server_member]);
+        let item = LuaMemberIndexItem::Many(Box::new([client_member, server_member]));
 
         let client_decl =
             item.resolve_semantic_decl_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
@@ -2374,7 +2377,7 @@ mod tests {
 
         let single = LuaMemberIndexItem::One(server_member)
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
-        let many = LuaMemberIndexItem::Many(vec![server_member])
+        let many = LuaMemberIndexItem::Many(Box::new([server_member]))
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
 
         assert_eq!(single, many);
@@ -2401,7 +2404,7 @@ mod tests {
 
         let single = LuaMemberIndexItem::One(shared_member)
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
-        let many = LuaMemberIndexItem::Many(vec![shared_member])
+        let many = LuaMemberIndexItem::Many(Box::new([shared_member]))
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
 
         assert_eq!(single, many);
@@ -2433,7 +2436,7 @@ mod tests {
 
         let single = LuaMemberIndexItem::One(isolated_member)
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
-        let many = LuaMemberIndexItem::Many(vec![isolated_member])
+        let many = LuaMemberIndexItem::Many(Box::new([isolated_member]))
             .visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(1));
 
         assert_eq!(single, many);
@@ -2447,7 +2450,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderSensitiveOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let shared_scope = TextRange::new(TextSize::new(0), TextSize::new(100));
 
         db.get_member_index_mut().add_member(
@@ -2470,7 +2473,7 @@ mod tests {
         db.get_member_index_mut()
             .add_function_scope_range(caller_file, shared_scope);
 
-        let item = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+        let item = LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]));
         let visible =
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
 
@@ -2482,7 +2485,7 @@ mod tests {
             LuaMemberOwner::Type(LuaTypeDeclId::global("FutureOnlyOwner")),
             LuaMember::new(
                 future_only_member,
-                LuaMemberKey::Name("field".into()),
+                LuaMemberKey::name("field"),
                 LuaMemberFeature::FileDefine,
                 None,
             ),
@@ -2503,7 +2506,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 80, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("CrossFunctionOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let use_scope = TextRange::new(TextSize::new(0), TextSize::new(40));
         let init_scope = TextRange::new(TextSize::new(50), TextSize::new(100));
 
@@ -2534,7 +2537,7 @@ mod tests {
         db.get_member_index_mut()
             .add_function_scope_range(caller_file, init_scope);
 
-        let item = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+        let item = LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]));
         let visible =
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
 
@@ -2546,7 +2549,7 @@ mod tests {
             .expect("both runtime assignments stay in the slot");
         assert_eq!(
             collapsed,
-            &LuaMemberIndexItem::Many(vec![earlier_member, later_member])
+            &LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]))
         );
         let collapsed_visible =
             collapsed.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
@@ -2559,7 +2562,7 @@ mod tests {
             future_owner,
             LuaMember::new(
                 future_only_member,
-                LuaMemberKey::Name("field".into()),
+                LuaMemberKey::name("field"),
                 LuaMemberFeature::FileDefine,
                 None,
             ),
@@ -2578,7 +2581,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("TopLevelOrderOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
 
         db.get_member_index_mut().add_member(
             owner.clone(),
@@ -2598,7 +2601,7 @@ mod tests {
         db.get_member_index_mut()
             .set_member_function_scope_range(later_member, None);
 
-        let item = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+        let item = LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]));
         let visible =
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
 
@@ -2616,7 +2619,7 @@ mod tests {
             owner,
             LuaMember::new(
                 declared_member,
-                LuaMemberKey::Name("field".into()),
+                LuaMemberKey::name("field"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -2635,7 +2638,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("AssignmentHistoryOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
 
         db.get_member_index_mut().add_member(
             owner.clone(),
@@ -2662,7 +2665,7 @@ mod tests {
             .expect("both runtime assignments stay in the slot");
         assert_eq!(
             item,
-            &LuaMemberIndexItem::Many(vec![earlier_member, later_member])
+            &LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]))
         );
 
         let visible =
@@ -2678,7 +2681,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("PreExpandedHistoryOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
 
         db.get_member_index_mut().add_member(
             owner.clone(),
@@ -2703,7 +2706,8 @@ mod tests {
             .get_member_index()
             .get_member_item(&owner, &key)
             .expect("both runtime assignments stay in the slot");
-        let pre_expanded_history = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
+        let pre_expanded_history =
+            LuaMemberIndexItem::Many(Box::new([earlier_member, later_member]));
 
         let expanded_visible = latest_item.visible_member_ids_with_realm_at_offset(
             &db,
@@ -2728,7 +2732,7 @@ mod tests {
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("LatestAssignmentOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
 
         db.get_member_index_mut().add_member(
             owner.clone(),
@@ -2805,7 +2809,7 @@ mod tests {
             owner.clone(),
             LuaMember::new(
                 library_member,
-                LuaMemberKey::Name("Create".into()),
+                LuaMemberKey::name("Create"),
                 LuaMemberFeature::MetaMethodDecl,
                 None,
             ),
@@ -2815,7 +2819,7 @@ mod tests {
             owner,
             LuaMember::new(
                 override_member,
-                LuaMemberKey::Name("Create".into()),
+                LuaMemberKey::name("Create"),
                 LuaMemberFeature::FileMethodDecl,
                 None,
             ),
@@ -2898,7 +2902,7 @@ mod tests {
         let first_library_member = make_member_id(first_library_file, 2);
         let second_library_member = make_member_id(second_library_file, 3);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Example"));
-        let key = LuaMemberKey::Name("Read".into());
+        let key = LuaMemberKey::name("Read");
 
         for (member_id, feature) in [
             (main_member, LuaMemberFeature::FileMethodDecl),

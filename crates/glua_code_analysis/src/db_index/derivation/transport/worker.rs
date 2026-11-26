@@ -142,7 +142,7 @@ impl WorkerContext {
         self.keys.log(evaluation, local, &self.snapshot.graph);
     }
 
-    pub(in super::super) fn key(&self, local: u32) -> &HashedKey {
+    pub(in super::super) fn key(&self, local: u32) -> &super::super::FactKey {
         self.keys.key(local, &self.snapshot.graph)
     }
 
@@ -158,18 +158,27 @@ impl WorkerContext {
             let Some(key) = self.graph().keys().live_key(*slot) else {
                 return false;
             };
-            !key.key().is_query_output()
-                || (!derivation::mapping_back() && self.snapshot.queries.contains_key(key))
+            !key.is_query_output()
+                || (!derivation::mapping_back()
+                    && self
+                        .snapshot
+                        .queries
+                        .contains_key(&HashedKey::new(key.clone())))
         })
     }
 
     pub(in super::super) fn local_queries_hold(&self, reads: &[u32]) -> bool {
         reads.iter().all(|local| {
             let key = self.key(*local);
-            !key.key().is_query_output()
+            !key.is_query_output()
                 || (!derivation::mapping_back()
                     && self.queries.get(local).is_some_and(|witness| {
-                        !witness.mixed && self.snapshot.queries.get(key) == Some(&witness.seen)
+                        !witness.mixed
+                            && self
+                                .snapshot
+                                .queries
+                                .get(&self.keys.hashed_key(*local, self.graph()))
+                                == Some(&witness.seen)
                     }))
         })
     }
@@ -228,8 +237,8 @@ impl WorkerContext {
 
     pub(in super::super) fn observe_ready(&mut self, local: u32) {
         if self.keys.is_query(local) {
-            let key = self.key(local);
-            let seen = self.snapshot.queries[key];
+            let key = self.keys.hashed_key(local, self.graph());
+            let seen = self.snapshot.queries[&key];
             self.observe(local, seen);
         }
     }
@@ -350,7 +359,10 @@ pub(crate) struct ComputeInputs {
 }
 
 impl ComputeInputs {
-    fn capture(worker: &WorkerContext, fingerprint: impl Fn(&HashedKey) -> Fingerprint) -> Self {
+    fn capture(
+        worker: &WorkerContext,
+        fingerprint: impl Fn(&super::super::FactKey) -> Fingerprint,
+    ) -> Self {
         let mut inputs = Self {
             reads: Vec::with_capacity(worker.keys.entries.len()),
             flags: Vec::new(),
@@ -362,7 +374,7 @@ impl ComputeInputs {
         let mut absent_bases = FxHashSet::default();
         for local in 0..worker.keys.entries.len() {
             let key = worker.key(local as u32);
-            if key.key().is_query_output() {
+            if key.is_query_output() {
                 if let Some(witness) = worker.queries.get(&(local as u32)) {
                     inputs.complete &= !witness.mixed;
                     inputs.reads.push((local as u32, witness.seen));
@@ -370,7 +382,12 @@ impl ComputeInputs {
                     inputs.complete = false;
                 }
             } else {
-                let seen = derivation::untracked(|| fingerprint(key));
+                let seen = derivation::untracked(|| match worker.keys.entries[local] {
+                    super::WorkerKey::Known(slot) => {
+                        worker.graph().slot_fingerprint(slot, &fingerprint)
+                    }
+                    super::WorkerKey::New(_) => fingerprint(key),
+                });
                 inputs.reads.push((local as u32, seen));
             }
             match worker.keys.entries[local] {
@@ -406,7 +423,7 @@ impl ComputeInputs {
         &self,
         keys: &WorkerKeys,
         table: &KeyTable,
-        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&super::super::FactKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         self.complete
             && self.flags.iter().all(|input| {
@@ -429,7 +446,9 @@ impl ComputeInputs {
             && self.reads.iter().all(|(local, seen)| {
                 let (key, slot) = match keys.entries[*local as usize] {
                     super::WorkerKey::Known(slot) => (table.live_key(slot), Some(slot)),
-                    super::WorkerKey::New(index) => (Some(&keys.new_keys[index as usize]), None),
+                    super::WorkerKey::New(index) => {
+                        (Some(keys.new_keys[index as usize].key()), None)
+                    }
                 };
                 key.is_some_and(|key| fingerprint(key, slot) == Some(*seen))
             })
@@ -449,7 +468,7 @@ impl WorkerEvaluation {
     pub(crate) fn validate(
         &self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&super::super::FactKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         self.validate_table(graph.keys(), fingerprint)
     }
@@ -457,20 +476,20 @@ impl WorkerEvaluation {
     pub(crate) fn read_keys<'a>(
         &'a self,
         graph: &'a ReaderGraph,
-    ) -> impl Iterator<Item = &'a HashedKey> {
+    ) -> impl Iterator<Item = &'a super::super::FactKey> {
         self.keys
             .entries
             .iter()
             .filter_map(move |entry| match *entry {
                 super::WorkerKey::Known(slot) => graph.keys().live_key(slot),
-                super::WorkerKey::New(index) => Some(&self.keys.new_keys[index as usize]),
+                super::WorkerKey::New(index) => Some(self.keys.new_keys[index as usize].key()),
             })
     }
 
     fn validate_table(
         &self,
         table: &KeyTable,
-        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&super::super::FactKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         table.quarantine_started() == Some(self.started)
             && self.inputs.validate(&self.keys, table, fingerprint)
@@ -529,7 +548,7 @@ pub(crate) fn compute_recorded<T>(
     snapshot: &RecordingSnapshot,
     id: DerivationId,
     compute: impl FnOnce() -> T,
-    fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+    fingerprint: impl Fn(&super::super::FactKey) -> Fingerprint,
 ) -> WorkerResult<T> {
     let saved = SavedRecording::take();
     let requires_canonical = Arc::new(AtomicBool::new(false));
@@ -700,17 +719,22 @@ impl TaskRecorder {
                 .map(|local| {
                     let key = worker.keys.key(*local, &snapshot.graph);
                     if ended.is_some_and(|ended| worker.keys.written_after(*local, ended))
-                        && !reset_before(key)
+                        && !reset_before(&worker.keys.hashed_key(*local, &snapshot.graph))
                     {
                         return ReadState::Unseen;
                     }
-                    if key.key().is_query_output() {
+                    if key.is_query_output() {
                         return ReadState::Query(
                             worker
                                 .queries
                                 .get(local)
                                 .map(|witness| witness.seen)
-                                .or_else(|| snapshot.queries.get(key).copied())
+                                .or_else(|| {
+                                    snapshot
+                                        .queries
+                                        .get(&worker.keys.hashed_key(*local, &snapshot.graph))
+                                        .copied()
+                                })
                                 .unwrap_or(derivation::UNSEEN),
                         );
                     }
@@ -718,7 +742,7 @@ impl TaskRecorder {
                         Some(slot) if !worker.keys.written_here_local(*local) => {
                             ReadState::Snapshot(slot)
                         }
-                        _ => ReadState::Fact(key.clone()),
+                        _ => ReadState::Fact(worker.keys.hashed_key(*local, &snapshot.graph)),
                     }
                 })
                 .collect()
@@ -741,11 +765,7 @@ impl TaskRecorder {
             worker.replay_counts.publish();
         }
         let task = worker.task.expect("a task records into its logs");
-        let written = worker
-            .keys
-            .written_keys(&worker.snapshot.graph)
-            .cloned()
-            .collect();
+        let written = worker.keys.written_keys(&worker.snapshot.graph).collect();
         self.query_scope.take();
         self.saved.take();
         TaskRecording {
@@ -1144,7 +1164,7 @@ mod tests {
     fn parallel_transport_worker_hints_stay_global_and_local_proofs_remap_once() {
         use std::sync::atomic::Ordering;
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(4), TextSize::new(8)));
-        let fact = HashedKey::new(FactKey::TypeCache(owner));
+        let fact = HashedKey::new(FactKey::type_cache(&owner));
         let mut graph = ReaderGraph::default();
         graph.intern_read(key(99));
         let global = graph.intern_read(fact.clone());
@@ -1196,7 +1216,7 @@ mod tests {
     #[test]
     fn parallel_transport_worker_getter_window_and_equal_value_flags_are_validated() {
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), TextSize::new(8)));
-        let fact = HashedKey::new(FactKey::TypeCache(owner.clone()));
+        let fact = HashedKey::new(FactKey::type_cache(&owner));
         let mut graph = ReaderGraph::default();
         graph.intern_read(fact.clone());
         let mut table = graph.lend_keys();
@@ -1236,7 +1256,7 @@ mod tests {
                 derivation::note_read(|| child.key().clone());
             },
             |key| {
-                assert_eq!(key, &child);
+                assert_eq!(key, child.key());
                 17
             },
         );
@@ -1421,7 +1441,7 @@ mod tests {
         use crate::{LuaMemberKey, LuaMemberOwner};
         let (snapshot, guard) = snapshot(ReaderGraph::default());
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), TextSize::new(8)));
-        let fact = FactKey::TypeCache(owner);
+        let fact = FactKey::type_cache(&owner);
         let handle = FactRead::default();
         handle.0.store(123, Ordering::Relaxed);
         let result = compute_recorded(
@@ -1432,7 +1452,7 @@ mod tests {
                 assert!(handle.note(|| fact.clone(), |key| key == &fact));
                 assert_eq!(handle.0.load(Ordering::Relaxed), 123);
                 let owner = LuaMemberOwner::LocalUnresolve;
-                let name = LuaMemberKey::Name("field".into());
+                let name = LuaMemberKey::name("field");
                 derivation::note_member_slot_read(&owner, &name);
                 derivation::note_member_slot_read(&owner, &name);
                 let proof = derivation::close_frame(frame, 0).unwrap();

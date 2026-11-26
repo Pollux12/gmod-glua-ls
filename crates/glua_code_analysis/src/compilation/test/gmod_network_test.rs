@@ -464,7 +464,7 @@ mod test {
         db.reader_graph()
             .derivations_of_file(file_id)
             .filter(|id| matches!(id.kind, DerivationKind::NetCall | DerivationKind::NetFlows))
-            .flat_map(|id| db.reader_graph().reads_of(id).map(|key| key.key().clone()))
+            .flat_map(|id| db.reader_graph().reads_of(id).cloned())
             .collect()
     }
 
@@ -576,7 +576,7 @@ end
             let mut reads = db
                 .reader_graph()
                 .reads_of(id)
-                .map(|key| format!("{:?}", key.key()))
+                .map(|key| format!("{key:?}"))
                 .collect::<Vec<_>>();
             reads.sort();
             let network = db.get_gmod_network_index();
@@ -701,5 +701,49 @@ end
             .send_flows
             .len();
         expect_that!(flows, eq(2usize));
+    }
+
+    #[gtest]
+    fn unused_callback_does_not_suppress_duplicate_helper_writes() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file = ws.def_file(
+            "addons/mytest/lua/autorun/server/unused_cb.lua",
+            r#"
+local function Ignore(cb)
+    local _ = cb
+end
+
+local WriteTwice
+
+local function WriteOne()
+    net.WriteString("x")
+    Ignore(WriteTwice)
+end
+
+WriteTwice = function()
+    WriteOne()
+    WriteOne()
+end
+
+net.Start("Twice")
+WriteTwice()
+net.Send(ply)
+"#,
+        );
+
+        let flows = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(file)
+            .expect("file has network data")
+            .send_flows
+            .clone();
+        assert_that!(flows.len(), eq(1usize));
+        expect_that!(flows[0].message_name, eq("Twice"));
+        expect_that!(
+            send_op_kinds(&flows[0]),
+            eq(&vec!["string".to_string(), "string".to_string()])
+        );
     }
 }

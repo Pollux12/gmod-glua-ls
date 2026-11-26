@@ -548,7 +548,7 @@ impl GmodClassMetadataIndex {
         }
         let fingerprint = Self::meta_fingerprint(kind, file_id, call);
         for name in names {
-            derivation::note_write(|| FactKey::GmodMeta(name.clone()));
+            derivation::note_write(|| FactKey::GmodMeta(name.as_str().into()));
             let previous = meta_fingerprints.get(&name).copied().unwrap_or_default();
             let value = if add {
                 previous.wrapping_add(fingerprint)
@@ -566,11 +566,11 @@ impl GmodClassMetadataIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::GmodMeta(name) if derivation::mapping_back() => {
-                self.recomputed_meta_fingerprint(name)
+                self.recomputed_meta_fingerprint(name.as_smol_str())
             }
             FactKey::GmodMeta(name) => self
                 .meta_fingerprints
-                .get(name)
+                .get(name.as_str())
                 .copied()
                 .unwrap_or(derivation::ABSENT),
             FactKey::GmodClassFile(file_id) => {
@@ -990,7 +990,7 @@ impl GmodClassMetadataIndex {
         vfs: &Vfs,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
-        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::GmodMeta(name.into()));
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -1026,7 +1026,7 @@ impl GmodClassMetadataIndex {
         vfs: &Vfs,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
-        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::GmodMeta(name.into()));
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -1062,7 +1062,7 @@ impl GmodClassMetadataIndex {
 
     /// Whether some file registers a panel named `name`.
     pub fn has_vgui_panel(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::GmodMeta(name.into()));
         self.vgui_panels.contains_key(name)
     }
 
@@ -1070,7 +1070,7 @@ impl GmodClassMetadataIndex {
     /// order: `None` when no file registers it, `Some(None)` when that
     /// registration names no base.
     pub fn get_vgui_panel_base(&self, vfs: &Vfs, name: &str) -> Option<Option<String>> {
-        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::GmodMeta(name.into()));
         self.vgui_panels.get(name).map(|definitions| {
             definitions
                 .iter()
@@ -1160,7 +1160,7 @@ impl GmodClassMetadataIndex {
             derivation::note_write(|| FactKey::VguiChain(type_id.clone()));
         }
         for name in self.meta_fingerprints.keys() {
-            derivation::note_write(|| FactKey::GmodMeta(name.clone()));
+            derivation::note_write(|| FactKey::GmodMeta(name.as_str().into()));
         }
         self.meta_fingerprints.clear();
         self.file_metadata.clear();

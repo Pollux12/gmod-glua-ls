@@ -334,8 +334,7 @@ fn build_type_signature_help(
         let description = db
             .get_property_index()
             .get_property(&semantic_id)
-            .and_then(|p| p.description.clone())
-            .map(|description| *description);
+            .and_then(|p| p.description().cloned());
 
         return build_doc_function_signature_help(
             builder,
@@ -615,8 +614,7 @@ fn build_generic_signature_help(
             let description = db
                 .get_property_index()
                 .get_property(&semantic_id)
-                .and_then(|p| p.description.clone())
-                .map(|description| *description);
+                .and_then(|p| p.description().cloned());
 
             return build_doc_function_signature_help(
                 builder,

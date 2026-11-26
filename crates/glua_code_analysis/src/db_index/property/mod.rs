@@ -3,7 +3,7 @@ mod decl_feature;
 mod property;
 
 use crate::db_index::cow_shards::{CowCell, CowShards};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::Entry};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -60,13 +60,40 @@ pub struct LuaPropertyContribution<'a> {
 }
 
 #[derive(Debug, Clone)]
+enum PropertyOwners {
+    One(LuaSemanticDeclId),
+    Many(Box<[LuaSemanticDeclId]>),
+}
+
+impl PropertyOwners {
+    fn as_slice(&self) -> &[LuaSemanticDeclId] {
+        match self {
+            Self::One(owner) => std::slice::from_ref(owner),
+            Self::Many(owners) => owners,
+        }
+    }
+
+    fn push(&mut self, owner_id: LuaSemanticDeclId) {
+        let owners = match self {
+            Self::One(owner) => Box::new([owner.clone(), owner_id]),
+            Self::Many(owners) => {
+                let mut owners = std::mem::take(owners).into_vec();
+                owners.push(owner_id);
+                owners.into_boxed_slice()
+            }
+        };
+        *self = Self::Many(owners);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LuaPropertyIndex {
     /// Merged view, read by `get_property`. For the common single-contributor property this is
     /// the contribution itself and nothing else is stored.
     properties: CowCell<HashMap<LuaPropertyId, LuaCommonProperty>>,
     property_owners_map: CowCell<HashMap<LuaSemanticDeclId, LuaPropertyId>>,
     /// `property_owners_map` inverted: the owners sharing each property.
-    owners_by_property: CowCell<HashMap<LuaPropertyId, Vec<LuaSemanticDeclId>>>,
+    owners_by_property: CowCell<HashMap<LuaPropertyId, PropertyOwners>>,
     signature_owner_by_property: CowCell<HashMap<LuaPropertyId, LuaSignatureId>>,
 
     /// `TypeDecl` properties are keyed by class name alone, so several files can document one
@@ -84,7 +111,6 @@ pub struct LuaPropertyIndex {
     /// multiple self-coalescing assignments in different scopes of the same
     /// function).  File ownership is tracked for cleanup on reindex.
     inferred_string_defaults: CowShards<LuaDeclId, Vec<LuaInferredStringDefault>>,
-    inferred_string_defaults_file_owners: CowShards<FileId, HashSet<LuaDeclId>>,
 }
 
 impl Default for LuaPropertyIndex {
@@ -106,7 +132,6 @@ impl LuaPropertyIndex {
             contributions: Default::default(),
             file_merge_order: Default::default(),
             inferred_string_defaults: Default::default(),
-            inferred_string_defaults_file_owners: Default::default(),
         }
     }
 
@@ -259,7 +284,7 @@ impl LuaPropertyIndex {
         file_id: FileId,
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
-        derivation::note_write(|| FactKey::Property(same_property_owner_id.clone()));
+        derivation::note_write(|| FactKey::property(same_property_owner_id.clone()));
         self.note_property_write(property_id);
         // Owner aliases are always within one file, so this file owns the property outright
         // unless a doc contribution has already promoted it.
@@ -427,7 +452,7 @@ impl LuaPropertyIndex {
     }
 
     pub fn get_property(&self, owner_id: &LuaSemanticDeclId) -> Option<&LuaCommonProperty> {
-        derivation::note_read(|| FactKey::Property(owner_id.clone()));
+        derivation::note_read(|| FactKey::property(owner_id.clone()));
         self.property_owners_map
             .get(owner_id)
             .and_then(|id| self.properties.get(id))
@@ -437,7 +462,7 @@ impl LuaPropertyIndex {
         &self,
         owner_id: &LuaSemanticDeclId,
     ) -> Option<crate::LuaSignatureId> {
-        derivation::note_read(|| FactKey::Property(owner_id.clone()));
+        derivation::note_read(|| FactKey::property(owner_id.clone()));
         let property_id = self.property_owners_map.get(owner_id)?;
         self.signature_owner_by_property.get(property_id).copied()
     }
@@ -511,6 +536,7 @@ impl LuaPropertyIndex {
         value: SmolStr,
         source_range: TextRange,
     ) {
+        debug_assert_eq!(file_id, decl_id.file_id);
         let entry = LuaInferredStringDefault {
             value,
             source_range,
@@ -520,10 +546,6 @@ impl LuaPropertyIndex {
             .entry(decl_id)
             .or_default()
             .push(entry);
-        self.inferred_string_defaults_file_owners
-            .entry(file_id)
-            .or_default()
-            .insert(decl_id);
     }
 
     /// Drops `decl_id`'s inferred string defaults before the derivations that
@@ -555,9 +577,9 @@ impl LuaPropertyIndex {
             .owners_by_property
             .get(&property_id)
             .into_iter()
-            .flatten()
+            .flat_map(PropertyOwners::as_slice)
         {
-            derivation::note_write(|| FactKey::Property(owner_id.clone()));
+            derivation::note_write(|| FactKey::property(owner_id.clone()));
         }
     }
 
@@ -571,10 +593,12 @@ impl LuaPropertyIndex {
             }
             self.forget_owner(previous, &owner_id);
         }
-        self.owners_by_property
-            .entry(property_id)
-            .or_default()
-            .push(owner_id);
+        match self.owners_by_property.entry(property_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(PropertyOwners::One(owner_id));
+            }
+            Entry::Occupied(mut entry) => entry.get_mut().push(owner_id),
+        }
     }
 
     fn unmap_owner(&mut self, owner_id: &LuaSemanticDeclId) {
@@ -584,10 +608,22 @@ impl LuaPropertyIndex {
     }
 
     fn forget_owner(&mut self, property_id: LuaPropertyId, owner_id: &LuaSemanticDeclId) {
-        if let Some(owners) = self.owners_by_property.get_mut(&property_id) {
-            owners.retain(|owner| owner != owner_id);
-            if owners.is_empty() {
-                self.owners_by_property.remove(&property_id);
+        if let Entry::Occupied(mut entry) = self.owners_by_property.entry(property_id) {
+            let owners = entry.get_mut();
+            match owners {
+                PropertyOwners::One(owner) if owner == owner_id => {
+                    entry.remove();
+                }
+                PropertyOwners::One(_) => {}
+                PropertyOwners::Many(many) => {
+                    let mut remaining = std::mem::take(many).into_vec();
+                    remaining.retain(|owner| owner != owner_id);
+                    *owners = if remaining.len() == 1 {
+                        PropertyOwners::One(remaining.remove(0))
+                    } else {
+                        PropertyOwners::Many(remaining.into_boxed_slice())
+                    };
+                }
             }
         }
     }
@@ -595,7 +631,7 @@ impl LuaPropertyIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::Property(owner_id) => {
-                let Some(property_id) = self.property_owners_map.get(owner_id) else {
+                let Some(property_id) = self.property_owners_map.get(owner_id.as_ref()) else {
                     return derivation::ABSENT;
                 };
                 derivation::fingerprint_of(&(
@@ -669,12 +705,15 @@ impl LuaIndex for LuaPropertyIndex {
             }
         }
         self.file_merge_order.remove(&file_id);
-        // Clean up inferred string defaults owned by this file.
-        if let Some(decl_ids) = self.inferred_string_defaults_file_owners.remove(&file_id) {
-            for decl_id in decl_ids {
-                self.inferred_string_defaults.remove(&decl_id);
-                derivation::note_write(|| FactKey::DeclDefault(decl_id));
-            }
+        let mut decl_ids: Vec<_> = self
+            .inferred_string_defaults
+            .file_entries(file_id)
+            .map(|(decl_id, _)| *decl_id)
+            .collect();
+        decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
+        for decl_id in decl_ids {
+            self.inferred_string_defaults.remove(&decl_id);
+            derivation::note_write(|| FactKey::DeclDefault(decl_id));
         }
     }
 
@@ -683,7 +722,7 @@ impl LuaIndex for LuaPropertyIndex {
             derivation::note_write(|| FactKey::DeclDefault(*decl_id));
         }
         for owner_id in self.property_owners_map.keys() {
-            derivation::note_write(|| FactKey::Property(owner_id.clone()));
+            derivation::note_write(|| FactKey::property(owner_id.clone()));
         }
         self.properties.clear();
         self.property_owners_map.clear();
@@ -694,7 +733,6 @@ impl LuaIndex for LuaPropertyIndex {
         self.file_merge_order.clear();
         self.in_filed_owner.clear();
         self.inferred_string_defaults.clear();
-        self.inferred_string_defaults_file_owners.clear();
         self.id_count = 0;
     }
 }
@@ -798,5 +836,4 @@ crate::db_index::cow_shards::task_fork_fields!(LuaPropertyIndex {
     id_count,
     in_filed_owner,
     inferred_string_defaults,
-    inferred_string_defaults_file_owners,
 });

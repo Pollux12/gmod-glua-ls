@@ -645,7 +645,7 @@ fn add_enum_members_completion(
                     .unwrap_or(LuaType::Unknown),
                 db.get_property_index()
                     .get_property(&LuaSemanticDeclId::Member(it.get_id()))
-                    .and_then(|property| property.description.as_deref().cloned()),
+                    .and_then(|property| property.description().cloned()),
             )
         })
         .sorted_by(|a, b| a.0.cmp(&b.0))

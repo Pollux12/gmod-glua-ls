@@ -476,11 +476,11 @@ pub fn analyze_return_cast(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturnCast)
             .db
             .get_signature_index_mut()
             .get_or_create(signature_id)
-            .return_cast = Some(LuaSignatureCast {
+            .return_cast = Some(Box::new(LuaSignatureCast {
             name: name.to_string(),
             cast,
             fallback_cast,
-        });
+        }));
     } else {
         report_orphan_tag(analyzer, &tag);
     }

@@ -859,7 +859,7 @@ fn global_member_identity_direct_valid_guard_mask(
     db: &DbIndex,
     name: &str,
 ) -> Option<GmodStateMask> {
-    let key = LuaMemberKey::Name(name.into());
+    let key = LuaMemberKey::name(name);
     let mut state_mask = None;
     for member in db
         .get_member_index()
@@ -1402,12 +1402,7 @@ end
         let reads = db
             .reader_graph()
             .reads_of(scan)
-            .filter(|key| {
-                !matches!(
-                    key.key(),
-                    crate::db_index::derivation::FactKey::ValidGuardName(_)
-                )
-            })
+            .filter(|key| !matches!(key, crate::db_index::derivation::FactKey::ValidGuardName(_)))
             .count();
         assert!(
             reads < 20,

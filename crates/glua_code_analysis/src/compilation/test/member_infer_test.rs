@@ -993,9 +993,11 @@ parser:parse()",
                     .get_key();
                 match key {
                     LuaMemberKey::Integer(1) => "integer".to_string(),
-                    LuaMemberKey::ExprType(LuaType::Integer) => "integer".to_string(),
+                    LuaMemberKey::ExprType(typ) if matches!(typ.as_ref(), LuaType::Integer) => {
+                        "integer".to_string()
+                    }
                     LuaMemberKey::ExprType(typ) if typ.is_table() => "table".to_string(),
-                    LuaMemberKey::Name(name) if name == "named" => "named".to_string(),
+                    LuaMemberKey::Name(name) if name.as_str() == "named" => "named".to_string(),
                     _ => panic!("unexpected member key: {key:?}"),
                 }
             };
@@ -1567,7 +1569,7 @@ parser:parse()",
             .unwrap_or_default();
         let owners = |name: &str| {
             members
-                .get(&LuaMemberKey::Name(name.into()))
+                .get(&LuaMemberKey::name(name))
                 .into_iter()
                 .flatten()
                 .map(|info| match &info.property_owner_id {
@@ -3191,7 +3193,7 @@ parser:parse()",
             semantic_model
                 .get_member_info_with_key(
                     &LuaType::Def(LuaTypeDeclId::global("SF")),
-                    LuaMemberKey::Name("SendStarfall".into()),
+                    LuaMemberKey::name("SendStarfall"),
                     true,
                 )
                 .is_none_or(|members| members.is_empty()),
@@ -3245,7 +3247,7 @@ parser:parse()",
             LuaMemberOwner::GlobalPath(GlobalId::new("BridgeClass")),
         );
 
-        let method_key = LuaMemberKey::Name("Method".into());
+        let method_key = LuaMemberKey::name("Method");
         let semantic_model = ws
             .analysis
             .compilation
@@ -5840,7 +5842,7 @@ end
                 .get_member_index()
                 .get_member_item(
                     &LuaMemberOwner::Type(LuaTypeDeclId::global(class)),
-                    &LuaMemberKey::Name(field.into()),
+                    &LuaMemberKey::name(field),
                 )
                 .is_some()
         }
@@ -6179,7 +6181,7 @@ PLUGIN.other_field = 123
             end
             "#,
             );
-            let unknown_key = LuaMemberKey::ExprType(LuaType::Unknown);
+            let unknown_key = LuaMemberKey::ExprType(Box::new(LuaType::Unknown));
             let collapsed_before: Vec<String> = ws
                 .analysis
                 .compilation
@@ -6251,7 +6253,7 @@ SWEP.Attachments = {[1] = {header = "Sight", offset = {800, -500}}}
                 .get_file_id(&base_uri)
                 .expect("base file must be indexed");
 
-            let key = LuaMemberKey::Name("keyText".into());
+            let key = LuaMemberKey::name("keyText");
             let member_owner = |ws: &VirtualWorkspace| -> Option<LuaMemberOwner> {
                 let member_index = ws.analysis.compilation.get_db().get_member_index();
                 let member_id = member_index

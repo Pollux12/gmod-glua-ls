@@ -80,6 +80,36 @@ pub(crate) fn analysis_stack_exhausted() -> bool {
     }
 }
 
+/// Drops thread-local caches held on the calling thread (syntax resolver
+/// memo, type-detail hash memo, and per-thread interner front-caches).
+pub fn release_thread_caches() {
+    glua_parser::clear_syntax_resolver_memo();
+    db_index::clear_thread_caches();
+}
+
+/// Drops thread-local analysis caches on every worker in the global Rayon
+/// pool and on the calling thread, running `on_thread` on each thread
+/// afterward (e.g. an allocator collection hook).
+pub fn release_analysis_caches_with(on_thread: impl Fn() + Sync) {
+    rayon::broadcast(|_| {
+        release_thread_caches();
+        on_thread();
+    });
+    release_thread_caches();
+    on_thread();
+}
+
+static ANALYSIS_HEAP_COLLECTOR: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Registers the process allocator's thread-local collection hook.
+pub fn set_analysis_heap_collector(collect: fn()) {
+    ANALYSIS_HEAP_COLLECTOR.get_or_init(|| collect);
+}
+
+pub(crate) fn purge_analysis_heap() {
+    release_analysis_caches_with(ANALYSIS_HEAP_COLLECTOR.get().copied().unwrap_or(|| {}));
+}
+
 /// True when `call_expr` calls an annotated net operation — a message start, a
 /// send terminator, or a payload write/read.
 ///
@@ -517,7 +547,7 @@ impl EmmyLuaAnalysis {
             UpdateProgress::Settled(mut affected) => {
                 let vfs = self.compilation.get_db_mut().get_vfs_mut();
                 vfs.forget_taken_deletions();
-                affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+                affected.retain(|file_id| vfs.has_file(file_id));
                 UpdateProgress::Settled(affected)
             }
             progress => progress,
@@ -532,7 +562,7 @@ impl EmmyLuaAnalysis {
         let mut affected = self.compilation.update_index(file_ids.clone());
         affected.extend(file_ids);
         let vfs = self.compilation.get_db().get_vfs();
-        affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+        affected.retain(|file_id| vfs.has_file(file_id));
         affected.sort_unstable();
         affected.dedup();
         affected

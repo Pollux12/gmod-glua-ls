@@ -466,11 +466,13 @@ impl LuaModuleIndex {
         }
         note_module_fact_write(file_id);
         if let Some(info) = self.file_module_map.get(&file_id) {
-            derivation::note_write(|| FactKey::ModuleName(SmolStr::new(&info.name)));
-            derivation::note_write(|| FactKey::ModulePath(SmolStr::new(&info.full_module_name)));
+            derivation::note_write(|| FactKey::ModuleName(info.name.as_str().into()));
+            derivation::note_write(|| FactKey::ModulePath(info.full_module_name.as_str().into()));
         }
         for env in self.legacy_module_envs.get(&file_id).into_iter().flatten() {
-            derivation::note_write(|| FactKey::ModuleNamespace(namespace_root(&env.module_path)));
+            derivation::note_write(|| {
+                FactKey::ModuleNamespace(namespace_root(&env.module_path).into())
+            });
         }
     }
 
@@ -521,7 +523,7 @@ impl LuaModuleIndex {
                     .legacy_module_envs
                     .iter()
                     .flat_map(|(file_id, envs)| envs.iter().map(move |env| (*file_id, env)))
-                    .filter(|(_, env)| namespace_root(&env.module_path) == *root)
+                    .filter(|(_, env)| namespace_root(&env.module_path) == root.as_str())
                     .map(|(file_id, env)| (file_id, env.module_path.as_str()))
                     .collect::<Vec<_>>();
                 if envs.is_empty() {
@@ -593,7 +595,7 @@ impl LuaModuleIndex {
     }
 
     pub fn has_legacy_module_namespace(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name)));
+        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name).into()));
         self.legacy_module_envs.values().flatten().any(|env| {
             env.module_path == name
                 || env
@@ -604,7 +606,7 @@ impl LuaModuleIndex {
     }
 
     pub fn has_legacy_module_namespace_for_file(&self, file_id: FileId, name: &str) -> bool {
-        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name)));
+        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name).into()));
         let Some(current_workspace_id) = self.get_workspace_id(file_id) else {
             return self.has_legacy_module_namespace(name);
         };
@@ -695,7 +697,7 @@ impl LuaModuleIndex {
             None => self.exact_find_module(&module_parts),
         };
         if let Some(module) = exact {
-            derivation::note_read(|| FactKey::ModulePath(SmolStr::new(&module_path)));
+            derivation::note_read(|| FactKey::ModulePath(module_path.as_str().into()));
             if contents {
                 derivation::note_read(|| FactKey::Module(module.file_id));
             }
@@ -712,7 +714,7 @@ impl LuaModuleIndex {
         } else {
             None
         };
-        derivation::note_read(|| FactKey::ModuleName(lookup_name(&module_path)));
+        derivation::note_read(|| FactKey::ModuleName(lookup_name(&module_path).into()));
         if contents && let Some(module) = result {
             derivation::note_read(|| FactKey::Module(module.file_id));
         }

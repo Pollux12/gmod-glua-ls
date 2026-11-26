@@ -1147,9 +1147,9 @@ fn find_matching_enum_member<'a>(
         let is_match = if is_enum_key {
             let member_key = member_decl.get_key();
             match (member_key, arg_type) {
-                (LuaMemberKey::Name(s), LuaType::StringConst(arg_s)) => s == arg_s.as_ref(),
+                (LuaMemberKey::Name(s), LuaType::StringConst(arg_s)) => s == arg_s,
                 (LuaMemberKey::Integer(i), LuaType::IntegerConst(arg_i)) => *i == *arg_i,
-                (LuaMemberKey::ExprType(typ), _) => typ == arg_type,
+                (LuaMemberKey::ExprType(typ), _) => typ.as_ref() == arg_type,
                 _ => false,
             }
         } else {

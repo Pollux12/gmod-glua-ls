@@ -707,7 +707,7 @@ fn humanize_table_const_type_detail_and_simple(
     if has_dynamic_wildcard && !has_dynamic_member && !truncated {
         let dynamic_member_string = build_table_member_string(
             db,
-            &LuaMemberKey::ExprType(LuaType::Unknown),
+            &LuaMemberKey::ExprType(Box::new(LuaType::Unknown)),
             &LuaType::Any,
             humanize_type(db, &LuaType::Any, level.next_level()),
             level,
@@ -1040,7 +1040,7 @@ fn build_table_member_string(
         }
         LuaMemberKey::Integer(i) => format!("[{i}]{separator}{member_value}"),
         LuaMemberKey::None => member_value,
-        LuaMemberKey::ExprType(LuaType::Integer) => member_value,
+        LuaMemberKey::ExprType(typ) if matches!(typ.as_ref(), LuaType::Integer) => member_value,
         LuaMemberKey::ExprType(typ) if typ.is_unknown() => {
             format!("[dynamic]{separator}{member_value}")
         }
@@ -1217,7 +1217,7 @@ Fields.first = 1
             let value_type = LuaType::StringConst(SmolStr::new(value).into());
             let rendered = build_table_member_string(
                 &db,
-                &LuaMemberKey::Name(key.into()),
+                &LuaMemberKey::name(key),
                 &value_type,
                 humanize_type(&db, &value_type, RenderLevel::Detailed),
                 RenderLevel::Detailed,
@@ -1232,7 +1232,7 @@ Fields.first = 1
         let object = LuaType::Object(
             LuaObjectType::new_with_fields(
                 BTreeMap::from([(
-                    LuaMemberKey::Name("\n".into()),
+                    LuaMemberKey::name("\n"),
                     LuaType::StringConst(SmolStr::new("\\n").into()),
                 )]),
                 Vec::new(),

@@ -328,7 +328,7 @@ mod tests {
 
         let consumer_file_id = file_id(&ws, "lua/starfall/editor/tabhandlers/tab_wire.lua");
         let db = ws.analysis.compilation.get_db();
-        let current_mode_key = crate::LuaMemberKey::Name("CurrentMode".into());
+        let current_mode_key = crate::LuaMemberKey::name("CurrentMode");
         let current_mode_members = db
             .get_member_index()
             .get_current_members_for_key(&current_mode_key)
@@ -358,7 +358,7 @@ mod tests {
 
         let db = ws.analysis.compilation.get_db();
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderedReplayPanel"));
-        let key = LuaMemberKey::Name("OrderedValue".into());
+        let key = LuaMemberKey::name("OrderedValue");
         let history = db
             .get_member_index()
             .get_current_owner_members_for_key(&owner, &key);
@@ -479,7 +479,7 @@ mod tests {
         );
 
         let db = ws.analysis.compilation.get_db();
-        let key = crate::LuaMemberKey::Name("SharedValue".into());
+        let key = crate::LuaMemberKey::name("SharedValue");
         let members = db
             .get_member_index()
             .get_current_members_for_key(&key)
@@ -514,7 +514,7 @@ mod tests {
         );
 
         let db = ws.analysis.compilation.get_db();
-        let key = crate::LuaMemberKey::Name("SharedValue".into());
+        let key = crate::LuaMemberKey::name("SharedValue");
         let members = db
             .get_member_index()
             .get_current_members_for_key(&key)

@@ -4,6 +4,8 @@ mod gmod_domains;
 mod signature;
 mod signature_cast;
 
+use std::collections::hash_map::Entry;
+
 use crate::db_index::cow_shards::{CowCell, CowShards};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
@@ -42,8 +44,8 @@ pub use signature::{
     LuaCallArgRole, LuaClassNameReturnAlias, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
     LuaGenericParamInfo, LuaNoDiscard, LuaOutParamInfo, LuaOutParamRoot, LuaReturnCorrelation,
     LuaSignature, LuaSignatureId, OVERLOAD_CALL_ARG_ATTRIBUTE, OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE,
-    ReturnTypeKind, SignaturePayloadRemap, SignatureReturnStatus, find_call_arg_role_from_type,
-    visit_call_arg_roles_from_type,
+    ParamDocs, ReturnTypeKind, SignaturePayloadRemap, SignatureReturnStatus,
+    find_call_arg_role_from_type, visit_call_arg_roles_from_type,
 };
 pub use signature_cast::{LuaCastAction, LuaCastOp, LuaCastTarget, LuaSignatureCast};
 
@@ -59,7 +61,6 @@ pub struct LuaSignatureIndex {
     /// source layer left it (`None`: the source layer has no such signature).
     /// A reset restores it.
     source_signatures: CowShards<LuaSignatureId, Option<LuaSignature>>,
-    in_file_signatures: CowShards<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: CowCell<HashMap<LuaSignatureId, LuaDeclId>>,
     effective_valid_guard_signatures: CowCell<HashMap<LuaSignatureId, GmodStateMask>>,
     /// Per-file valid-guard contributions feeding the effective set: file →
@@ -173,6 +174,31 @@ impl Default for LuaSignatureIndex {
     }
 }
 
+pub struct FileSignatureIds<'a, I> {
+    signatures: &'a CowShards<LuaSignatureId, LuaSignature>,
+    file_id: FileId,
+    ids: I,
+}
+
+impl<I> FileSignatureIds<'_, I> {
+    pub fn iter(self) -> I {
+        self.ids
+    }
+
+    pub fn contains(&self, id: &LuaSignatureId) -> bool {
+        id.get_file_id() == self.file_id && self.signatures.contains_key(id)
+    }
+}
+
+impl<I: Iterator> IntoIterator for FileSignatureIds<'_, I> {
+    type Item = I::Item;
+    type IntoIter = I;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids
+    }
+}
+
 impl LuaSignatureIndex {
     pub(crate) fn note_return_write(&mut self, signature_id: LuaSignatureId) {
         derivation::note_write(|| FactKey::Signature(signature_id));
@@ -188,7 +214,6 @@ impl LuaSignatureIndex {
         Self {
             signatures: Default::default(),
             source_signatures: Default::default(),
-            in_file_signatures: Default::default(),
             local_func_decls: Default::default(),
             effective_valid_guard_signatures: Default::default(),
             valid_guard_file_contributions: Default::default(),
@@ -231,9 +256,6 @@ impl LuaSignatureIndex {
             }
             None => {
                 self.signatures.remove(signature_id);
-                if let Some(ids) = self.in_file_signatures.get_mut(&signature_id.get_file_id()) {
-                    ids.remove(signature_id);
-                }
             }
         }
     }
@@ -241,15 +263,13 @@ impl LuaSignatureIndex {
     pub fn get_or_create(&mut self, signature_id: LuaSignatureId) -> &mut LuaSignature {
         self.snapshot_source(signature_id);
         derivation::note_write(|| FactKey::Signature(signature_id));
-        if self
-            .in_file_signatures
-            .entry(signature_id.get_file_id())
-            .or_default()
-            .insert(signature_id)
-        {
-            derivation::note_write(|| FactKey::SignatureFile(signature_id.get_file_id()));
+        match self.signatures.entry(signature_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                derivation::note_write(|| FactKey::SignatureFile(signature_id.get_file_id()));
+                entry.insert(LuaSignature::default())
+            }
         }
-        self.signatures.entry(signature_id).or_default()
     }
 
     pub fn get(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignature> {
@@ -364,7 +384,7 @@ impl LuaSignatureIndex {
     /// Records that `file_id`'s docs mark a definition named `name` as a
     /// valid guard.
     pub(crate) fn add_valid_guard_name(&mut self, file_id: FileId, name: SmolStr) {
-        derivation::note_write(|| FactKey::ValidGuardName(name.clone()));
+        derivation::note_write(|| FactKey::ValidGuardName(name.as_str().into()));
         *self
             .valid_guard_name_counts
             .entry(name.clone())
@@ -377,7 +397,7 @@ impl LuaSignatureIndex {
 
     fn remove_valid_guard_names(&mut self, file_id: FileId) {
         for name in self.valid_guard_names.remove(&file_id).unwrap_or_default() {
-            derivation::note_write(|| FactKey::ValidGuardName(name.clone()));
+            derivation::note_write(|| FactKey::ValidGuardName(name.as_str().into()));
             let Some(count) = self.valid_guard_name_counts.get_mut(&name) else {
                 continue;
             };
@@ -390,7 +410,7 @@ impl LuaSignatureIndex {
 
     /// Whether some definition named `name` is marked a valid guard.
     pub(crate) fn is_valid_guard_name(&self, name: &str) -> bool {
-        derivation::note_read(|| FactKey::ValidGuardName(SmolStr::new(name)));
+        derivation::note_read(|| FactKey::ValidGuardName(name.into()));
         self.valid_guard_name_counts.contains_key(name)
     }
 
@@ -527,7 +547,7 @@ impl LuaSignatureIndex {
 
     /// Indexed per-holder payload population shared by snapshot and remap.
     ///
-    /// `in_file_signatures[holder]` owns the holder's signature ids (position
+    /// The holder's shard owns its signature ids (position
     /// sorted); looking each id up in `inferred_positive_guards` covers the
     /// holder's positive guards without scanning the workspace map.
     /// `inferred_guard_owners_by_file[holder]` owns the holder's guard-fact
@@ -538,11 +558,9 @@ impl LuaSignatureIndex {
         holder: FileId,
     ) -> (Vec<LuaSignatureId>, Vec<LuaInferredGuardOwner>) {
         let mut signature_ids: Vec<_> = self
-            .in_file_signatures
-            .get(&holder)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
+            .signatures
+            .file_entries(holder)
+            .map(|(id, _)| *id)
             .collect();
         signature_ids.sort_by_key(|id| u32::from(id.get_position()));
         let fact_owners: Vec<_> = self
@@ -800,7 +818,7 @@ impl LuaSignatureIndex {
             }
             FactKey::ValidGuardFiles => self.valid_guard_files.get(),
             FactKey::ValidGuardName(name) => {
-                if self.valid_guard_name_counts.contains_key(name) {
+                if self.valid_guard_name_counts.contains_key(name.as_str()) {
                     derivation::fingerprint_of(name)
                 } else {
                     derivation::ABSENT
@@ -818,13 +836,16 @@ impl LuaSignatureIndex {
                 derivation::fingerprint_of(&(positive_guard, guard_owner))
             }
             FactKey::SignatureFile(file_id) => {
-                self.in_file_signatures
-                    .get(file_id)
-                    .map_or(derivation::ABSENT, |ids| {
-                        let mut ids: Vec<_> = ids.iter().collect();
-                        ids.sort_unstable_by_key(|id| u32::from(id.get_position()));
-                        derivation::fingerprint_of(&ids)
-                    })
+                let mut ids: Vec<_> = self
+                    .signatures
+                    .file_entries(*file_id)
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    return derivation::ABSENT;
+                }
+                ids.sort_unstable_by_key(|id| u32::from(id.get_position()));
+                derivation::fingerprint_of(&ids)
             }
             FactKey::ReceiverOutParam(member_name) => {
                 if self
@@ -843,9 +864,22 @@ impl LuaSignatureIndex {
         }
     }
 
-    pub fn get_file_signature_ids(&self, file_id: FileId) -> Option<&HashSet<LuaSignatureId>> {
+    pub fn get_file_signature_ids(
+        &self,
+        file_id: FileId,
+    ) -> Option<FileSignatureIds<'_, impl Iterator<Item = &LuaSignatureId>>> {
         derivation::note_read(|| FactKey::SignatureFile(file_id));
-        self.in_file_signatures.get(&file_id)
+        let mut ids = self
+            .signatures
+            .file_entries(file_id)
+            .map(|(id, _)| id)
+            .peekable();
+        ids.peek()?;
+        Some(FileSignatureIds {
+            signatures: &self.signatures,
+            file_id,
+            ids,
+        })
     }
 }
 
@@ -854,8 +888,14 @@ impl LuaIndex for LuaSignatureIndex {
         // Drop only the removed file's holder edges. Reverse edges where it is
         // the referenced source stay so a later remap can still report loss.
         self.drop_payload_holder_edges(file_id);
-        if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
+        let mut signature_ids: Vec<_> = self
+            .signatures
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
+            .collect();
+        if !signature_ids.is_empty() {
             derivation::note_write(|| FactKey::SignatureFile(file_id));
+            signature_ids.sort_unstable_by_key(|id| id.get_position());
             for signature_id in signature_ids {
                 derivation::note_write(|| FactKey::Signature(signature_id));
                 self.source_signatures.remove(&signature_id);
@@ -913,8 +953,13 @@ impl LuaIndex for LuaSignatureIndex {
 
     fn clear(&mut self) {
         if derivation::recording() {
-            for file_id in self.in_file_signatures.keys() {
-                derivation::note_write(|| FactKey::SignatureFile(*file_id));
+            let mut previous_file = None;
+            for signature_id in self.signatures.keys() {
+                let file_id = signature_id.get_file_id();
+                if previous_file != Some(file_id) {
+                    derivation::note_write(|| FactKey::SignatureFile(file_id));
+                    previous_file = Some(file_id);
+                }
             }
             for signature_id in self.signatures.keys().chain(self.local_func_decls.keys()) {
                 derivation::note_write(|| FactKey::Signature(*signature_id));
@@ -935,7 +980,6 @@ impl LuaIndex for LuaSignatureIndex {
         }
         self.signatures.clear();
         self.source_signatures.clear();
-        self.in_file_signatures.clear();
         self.local_func_decls.clear();
         self.effective_valid_guard_signatures.clear();
         self.clear_valid_guard_contributions();
@@ -1269,7 +1313,6 @@ mod tests {
 crate::db_index::cow_shards::task_fork_fields!(LuaSignatureIndex {
     signatures,
     source_signatures,
-    in_file_signatures,
     local_func_decls,
     effective_valid_guard_signatures,
     valid_guard_file_contributions,

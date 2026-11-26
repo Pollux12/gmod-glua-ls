@@ -29,13 +29,14 @@ use rowan::{TextRange, TextSize};
 // hashing alone was 3.9% of all CPU under the default SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
-pub(crate) use type_decl::LuaTypeExtra;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
+pub(crate) use type_decl::{LuaTypeExtra, clear_type_decl_id_intern_cache};
 pub use type_ops::TypeOps;
 pub(crate) use type_owner::widens_primitive;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type, leaks_unsubstituted_tpl};
 pub(crate) use type_owner::{is_undetermined_type, is_unresolved_type};
 pub use type_visit_trait::TypeVisitTrait;
+pub(crate) use types::clear_type_detail_memo;
 pub use types::*;
 
 #[derive(Debug, Clone)]
@@ -414,7 +415,7 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                     lost |= result.lost;
                     if let Some(typ) = result.typ {
                         changed = true;
-                        crate::LuaMemberKey::ExprType(typ)
+                        crate::LuaMemberKey::ExprType(Box::new(typ))
                     } else {
                         k.clone()
                     }
@@ -1371,6 +1372,9 @@ struct TypeFact {
     read: derivation::FactRead,
 }
 
+const _: () = assert!(std::mem::size_of::<LuaType>() == 16);
+const _: () = assert!(std::mem::size_of::<TypeFact>() == 32);
+
 impl std::ops::Deref for TypeFact {
     type Target = LuaTypeCache;
 
@@ -1382,6 +1386,35 @@ impl std::ops::Deref for TypeFact {
 impl std::hash::Hash for TypeFact {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.cache, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileIdSet {
+    One(FileId),
+    Many(Box<[FileId]>),
+}
+
+const _: () = assert!(std::mem::size_of::<FileIdSet>() == 16);
+
+impl FileIdSet {
+    fn from_set(files: HashSet<FileId>) -> Option<Self> {
+        match files.len() {
+            0 => None,
+            1 => files.into_iter().next().map(Self::One),
+            _ => {
+                let mut files: Vec<_> = files.into_iter().collect();
+                files.sort_unstable();
+                Some(Self::Many(files.into_boxed_slice()))
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[FileId] {
+        match self {
+            Self::One(file) => std::slice::from_ref(file),
+            Self::Many(files) => files,
+        }
     }
 }
 
@@ -1429,7 +1462,6 @@ pub struct LuaTypeIndex {
     table_literal_decls: CowCell<HashMap<FileId, HashSet<LuaDeclId>>>,
     types: CowShards<LuaTypeOwner, TypeFact>,
     cache_refs: TypeCacheRefIndex,
-    in_filed_type_owner: CowShards<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: CowShards<LuaTypeOwner, LuaTypeFactMetadata>,
     /// The files one fact's provenance and step types name, per fact owner,
     /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
@@ -1438,12 +1470,12 @@ pub struct LuaTypeIndex {
     /// and support files plus `TableConst`/`Instance`/`Signature` files in the
     /// step types), so a fact outside the edited file's bucket remaps to
     /// itself.
-    fact_ref_files: CowShards<LuaTypeOwner, HashSet<FileId>>,
+    fact_ref_files: CowShards<LuaTypeOwner, FileIdSet>,
     fact_refs_by_file: CowShards<FileId, HashSet<LuaTypeOwner>>,
     /// The [`Self::fact_ref_files`] counterpart for definition facts, whose
     /// payload type can name another file's literal or signature on top of
     /// the provenance every fact carries.
-    definition_fact_ref_files: CowShards<LuaDefinitionId, HashSet<FileId>>,
+    definition_fact_ref_files: CowShards<LuaDefinitionId, FileIdSet>,
     definition_fact_refs_by_file: CowShards<FileId, HashSet<LuaDefinitionId>>,
     /// For each decl whose type a write has seeded: that write's source
     /// position, and whether its right-hand side was a call or index read. See
@@ -1497,7 +1529,7 @@ struct StatementType {
 
 /// The fact holding the type `owner`'s statements wrote.
 fn statement_fact(owner: &LuaTypeOwner) -> crate::LostFact {
-    crate::LostFact::new(owner.get_file_id(), FactKey::TypeCache(owner.clone()))
+    crate::LostFact::new(owner.get_file_id(), FactKey::type_cache(owner))
 }
 
 /// Notes a write of `owner`'s stored type. A file's local fallbacks move it
@@ -1506,10 +1538,10 @@ fn statement_fact(owner: &LuaTypeOwner) -> crate::LostFact {
 fn note_type_written(owner: &LuaTypeOwner) {
     let file_id = owner.get_file_id();
     if derivation::writes_fallback_of(file_id) {
-        derivation::rehoming(|| derivation::note_write(|| FactKey::TypeCache(owner.clone())));
+        derivation::rehoming(|| derivation::note_write(|| FactKey::type_cache(owner)));
         derivation::note_write(|| FactKey::TypeFallbacks(file_id));
     } else {
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
     }
 }
 
@@ -1572,7 +1604,6 @@ impl LuaTypeIndex {
             table_literal_decls: Default::default(),
             types: CowShards::default(),
             cache_refs: Default::default(),
-            in_filed_type_owner: Default::default(),
             fact_ref_files: Default::default(),
             fact_refs_by_file: Default::default(),
             definition_fact_ref_files: Default::default(),
@@ -2556,12 +2587,7 @@ impl LuaTypeIndex {
     }
 
     fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
-        let file_id = owner.get_file_id();
         let replaced = self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         if replaced && self.fact_metadata.remove(&owner).is_some() {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
@@ -2571,8 +2597,8 @@ impl LuaTypeIndex {
     /// The type-cache owners recorded for a file, used to re-derive a file's
     /// decls after a late index (e.g. vgui parent chains) makes a broad fallback
     /// resolvable.
-    pub fn file_type_owners(&self, file_id: FileId) -> Option<&HashSet<LuaTypeOwner>> {
-        self.in_filed_type_owner.get(&file_id)
+    pub fn file_type_owners(&self, file_id: FileId) -> impl Iterator<Item = &LuaTypeOwner> + '_ {
+        self.types.file_entries(file_id).map(|(owner, _)| owner)
     }
 
     pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
@@ -2589,12 +2615,7 @@ impl LuaTypeIndex {
         }) {
             return;
         }
-        let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         if self.fact_metadata.remove(&owner).is_some() {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
@@ -2632,12 +2653,7 @@ impl LuaTypeIndex {
             return;
         }
 
-        let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
         self.mark_inference_derived_state_dirty();
@@ -2758,7 +2774,7 @@ impl LuaTypeIndex {
         let stored = self.types.get(owner);
         if let Some(stored) = stored {
             if !stored.read.note(
-                || FactKey::TypeCache(owner.clone()),
+                || FactKey::type_cache(owner),
                 |key| matches!(key, FactKey::TypeCache(stored) if stored == owner),
             ) {
                 derivation::note_type_cache_read(owner);
@@ -2768,7 +2784,7 @@ impl LuaTypeIndex {
         }
         match self.statement_type(owner).filter(|_| {
             stored.map_or_else(
-                || derivation::recomputes(FactKey::TypeCache(owner.clone())),
+                || derivation::recomputes(FactKey::type_cache(owner)),
                 |stored| stored.read.recomputes(owner),
             )
         }) {
@@ -2811,7 +2827,7 @@ impl LuaTypeIndex {
             return true;
         };
         self.set_statement_type(owner, written);
-        if !derivation::recomputes(FactKey::TypeCache(owner.clone())) {
+        if !derivation::recomputes(FactKey::type_cache(owner)) {
             derivation::rerun_current();
         }
         true
@@ -2863,7 +2879,7 @@ impl LuaTypeIndex {
         if metadata_moved {
             self.refresh_fact_refs(owner);
         }
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
     }
 
     /// Drops the types `file_id`'s local fallbacks published, restoring what
@@ -2903,10 +2919,6 @@ impl LuaTypeIndex {
             return file_id;
         }
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
         self.record_source_write(&owner);
@@ -3010,7 +3022,7 @@ impl LuaTypeIndex {
         owner: &LuaTypeOwner,
         value: Option<(LuaTypeCache, Option<LuaTypeFactMetadata>)>,
     ) {
-        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_write(|| FactKey::type_cache(owner));
         match value {
             Some((cache, metadata)) => {
                 self.insert_type_cache(owner.clone(), cache);
@@ -3027,9 +3039,6 @@ impl LuaTypeIndex {
                 }
             }
             None => {
-                if let Some(set) = self.in_filed_type_owner.get_mut(&owner.get_file_id()) {
-                    set.remove(owner);
-                }
                 if let LuaTypeOwner::Decl(decl_id) = owner {
                     self.unbind_decl(decl_id);
                 }
@@ -3290,10 +3299,7 @@ impl LuaTypeIndex {
         let mut removed = Vec::new();
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
-            if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
-                set.remove(&owner);
-            }
+            derivation::note_write(|| FactKey::type_cache(&owner));
             // `cache_refs` has to come off with the cache, the way
             // `insert_type_cache` and the file sweep both keep them in step.
             if let Some(previous) = self.types.remove(&owner) {
@@ -3329,8 +3335,11 @@ impl LuaTypeIndex {
         let candidate_owners: Vec<LuaTypeOwner> = self
             .cache_refs
             .owners_referencing_file(remap.file_id)
-            .filter_map(|owner_file_id| self.in_filed_type_owner.get(&owner_file_id))
-            .flatten()
+            .flat_map(|owner_file_id| {
+                self.types
+                    .file_entries(owner_file_id)
+                    .map(|(owner, _)| owner)
+            })
             .cloned()
             .collect();
 
@@ -3468,7 +3477,7 @@ impl LuaTypeIndex {
         // Ordered by a real key rather than hash-map iteration order.
         metadata_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (owner, metadata) in metadata_updates {
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+            derivation::note_write(|| FactKey::type_cache(&owner));
             self.fact_metadata.insert(owner, metadata);
         }
 
@@ -3643,13 +3652,14 @@ impl LuaTypeIndex {
         }
         match key {
             FactKey::TypeCache(owner) => {
-                let Some(cache) = self.types.get(owner) else {
+                let owner = owner.to_owner();
+                let Some(cache) = self.types.get(&owner) else {
                     return derivation::ABSENT;
                 };
-                let metadata = self.fact_metadata.get(owner);
+                let metadata = self.fact_metadata.get(&owner);
                 // What the statements left under a fallback moves the key
                 // too: the fallback was guessed from it.
-                match self.statement_type(owner).filter(|statement| {
+                match self.statement_type(&owner).filter(|statement| {
                     statement.cache.as_ref() != Some(&cache.cache)
                         || statement.metadata.as_ref() != metadata
                 }) {
@@ -4098,7 +4108,6 @@ impl LuaIndex for LuaTypeIndex {
         self.table_classes.clear();
         self.fallbacks.clear();
         self.cache_refs = Default::default();
-        self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
         self.fact_ref_files.clear();
         self.fact_refs_by_file.clear();
@@ -4219,20 +4228,23 @@ impl LuaTypeIndex {
         if self.fallbacks.remove(&file_id).is_some() {
             derivation::note_write(|| FactKey::TypeFallbacks(file_id));
         }
-        if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
-            for type_owner in type_owners {
-                derivation::note_write(|| FactKey::TypeCache(type_owner.clone()));
-                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
-                    if self.decl_write_claims.remove(decl_id).is_some() {
-                        derivation::note_write(|| FactKey::DeclClaim(*decl_id));
-                    }
-                    self.unbind_decl(decl_id);
+        let type_owners: Vec<LuaTypeOwner> = self
+            .types
+            .file_entries(file_id)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        for type_owner in type_owners {
+            derivation::note_write(|| FactKey::type_cache(&type_owner));
+            if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                if self.decl_write_claims.remove(decl_id).is_some() {
+                    derivation::note_write(|| FactKey::DeclClaim(*decl_id));
                 }
-                self.types.remove(&type_owner);
-                self.fact_metadata.remove(&type_owner);
-                self.drop_fact_refs(&type_owner);
-                self.source_types.remove(&type_owner);
+                self.unbind_decl(decl_id);
             }
+            self.types.remove(&type_owner);
+            self.fact_metadata.remove(&type_owner);
+            self.drop_fact_refs(&type_owner);
+            self.source_types.remove(&type_owner);
         }
 
         self.cache_refs.remove_file(file_id);
@@ -4273,7 +4285,7 @@ impl LuaTypeIndex {
             }
         }
         for owner in self.types.keys() {
-            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+            derivation::note_write(|| FactKey::type_cache(owner));
         }
         for file_id in self.fallbacks.keys() {
             derivation::note_write(|| FactKey::TypeFallbacks(*file_id));
@@ -4339,15 +4351,21 @@ fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
 /// Re-points `key`'s reverse edges at `files`, dropping the stale ones.
 fn replace_reverse_edges<K>(
     by_file: &mut CowShards<FileId, HashSet<K>>,
-    forward: &mut CowShards<K, HashSet<FileId>>,
+    forward: &mut CowShards<K, FileIdSet>,
     key: K,
     files: HashSet<FileId>,
 ) where
     K: ShardKey + Clone,
 {
-    if let Some(previous) = forward.insert(key.clone(), files.clone()) {
-        for file_id in previous.difference(&files) {
-            if let Some(keys) = by_file.get_mut(file_id) {
+    let Some(files) = FileIdSet::from_set(files) else {
+        remove_reverse_edges(by_file, forward, &key);
+        return;
+    };
+    if let Some(previous) = forward.get(&key) {
+        for file_id in previous.as_slice() {
+            if files.as_slice().binary_search(file_id).is_err()
+                && let Some(keys) = by_file.get_mut(file_id)
+            {
                 keys.remove(&key);
                 if keys.is_empty() {
                     by_file.remove(file_id);
@@ -4355,18 +4373,16 @@ fn replace_reverse_edges<K>(
             }
         }
     }
-    for file_id in &files {
+    for file_id in files.as_slice() {
         by_file.entry(*file_id).or_default().insert(key.clone());
     }
-    if files.is_empty() {
-        forward.remove(&key);
-    }
+    forward.insert(key, files);
 }
 
 /// Drops `key`'s reverse edges entirely.
 fn remove_reverse_edges<K>(
     by_file: &mut CowShards<FileId, HashSet<K>>,
-    forward: &mut CowShards<K, HashSet<FileId>>,
+    forward: &mut CowShards<K, FileIdSet>,
     key: &K,
 ) where
     K: ShardKey + Clone,
@@ -4374,11 +4390,11 @@ fn remove_reverse_edges<K>(
     let Some(files) = forward.remove(key) else {
         return;
     };
-    for file_id in files {
-        if let Some(keys) = by_file.get_mut(&file_id) {
+    for file_id in files.as_slice() {
+        if let Some(keys) = by_file.get_mut(file_id) {
             keys.remove(key);
             if keys.is_empty() {
-                by_file.remove(&file_id);
+                by_file.remove(file_id);
             }
         }
     }
@@ -5198,7 +5214,6 @@ mod batch_removal_tests {
         assert_eq!(left.decl_type_binds, right.decl_type_binds);
         assert_eq!(left.type_bound_decls, right.type_bound_decls);
         assert_eq!(type_cache_types(left), type_cache_types(right));
-        assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
         assert_eq!(left.definition_facts, right.definition_facts);
         assert_eq!(
@@ -5259,15 +5274,21 @@ mod batch_removal_tests {
     fn assert_reverse_maps_consistent(index: &LuaTypeIndex) {
         for (owner, metadata) in &index.fact_metadata {
             let expected = LuaTypeIndex::metadata_referenced_files(metadata);
+            let mut expected: Vec<_> = expected.into_iter().collect();
+            expected.sort_unstable();
             assert_eq!(
-                index.fact_ref_files.get(owner).cloned().unwrap_or_default(),
+                index
+                    .fact_ref_files
+                    .get(owner)
+                    .map(FileIdSet::as_slice)
+                    .unwrap_or_default(),
                 expected,
                 "fact refs for {owner:?}"
             );
         }
         let mut expected_by_file: HashMap<FileId, HashSet<LuaTypeOwner>> = HashMap::default();
         for (owner, files) in &index.fact_ref_files {
-            for file_id in files {
+            for file_id in files.as_slice() {
                 expected_by_file
                     .entry(*file_id)
                     .or_default()
@@ -5278,11 +5299,13 @@ mod batch_removal_tests {
 
         for (definition, fact) in &index.definition_facts {
             let expected = type_fact_referenced_files(fact);
+            let mut expected: Vec<_> = expected.into_iter().collect();
+            expected.sort_unstable();
             assert_eq!(
                 index
                     .definition_fact_ref_files
                     .get(definition)
-                    .cloned()
+                    .map(FileIdSet::as_slice)
                     .unwrap_or_default(),
                 expected,
                 "definition fact refs for {definition:?}"
@@ -5291,7 +5314,7 @@ mod batch_removal_tests {
         let mut expected_definitions: HashMap<FileId, HashSet<LuaDefinitionId>> =
             HashMap::default();
         for (definition, files) in &index.definition_fact_ref_files {
-            for file_id in files {
+            for file_id in files.as_slice() {
                 expected_definitions
                     .entry(*file_id)
                     .or_default()
@@ -5390,7 +5413,6 @@ mod batch_removal_tests {
         assert_eq!(removed.supers_by_file, fresh.supers_by_file);
         assert_eq!(removed.sub_types, fresh.sub_types);
         assert_eq!(type_cache_types(&removed), type_cache_types(&fresh));
-        assert_eq!(removed.in_filed_type_owner, fresh.in_filed_type_owner);
         assert_eq!(removed.fact_metadata, fresh.fact_metadata);
         assert_eq!(removed.fact_ref_files, fresh.fact_ref_files);
         assert_eq!(removed.fact_refs_by_file, fresh.fact_refs_by_file);
@@ -5591,7 +5613,6 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     table_literal_decls,
     types,
     cache_refs,
-    in_filed_type_owner,
     fact_metadata,
     fact_ref_files,
     fact_refs_by_file => crate::db_index::cow_shards::merge_set,

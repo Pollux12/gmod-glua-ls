@@ -49,6 +49,10 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.backtrace]
+version = "0.3"
+optional = true
+
 [dev-dependencies]
 crossbeam-channel.workspace = true
 googletest.workspace = true
@@ -61,3 +65,4 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:mimalloc"]
+alloc-sample = ["cli", "dep:backtrace"]

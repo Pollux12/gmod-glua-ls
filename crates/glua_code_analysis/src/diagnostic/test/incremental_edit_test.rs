@@ -426,10 +426,7 @@ mod tests {
         let db = ws.analysis.compilation.get_db();
         let mut dangling = Vec::new();
         for file_id in db.get_vfs().get_all_file_ids() {
-            let Some(owners) = db.get_type_index().file_type_owners(file_id) else {
-                continue;
-            };
-            for owner in owners.iter() {
+            for owner in db.get_type_index().file_type_owners(file_id) {
                 let Some(cache) = db.get_type_index().get_type_cache(owner) else {
                     continue;
                 };
@@ -1822,7 +1819,7 @@ net.Broadcast()
                 panic!("pairs value should be a compact record");
             };
             value
-                .get_field(&LuaMemberKey::Name("damageReduction".into()))
+                .get_field(&LuaMemberKey::name("damageReduction"))
                 .cloned()
                 .expect("damageReduction field")
         }

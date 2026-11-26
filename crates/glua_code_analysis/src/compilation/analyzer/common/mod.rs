@@ -241,7 +241,7 @@ pub fn bind_type(
     } else {
         // A write that leaves the slot as it is still produces it, so a reset
         // of the statement's outputs reaches what it seeded on an earlier run.
-        derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
+        derivation::note_write(|| derivation::FactKey::type_cache(&type_owner));
         let decl_type_cache = decl_type_cache?;
         let decl_type = decl_type_cache.as_type();
         if should_replace_uninformative_inferred_cache(&type_owner, decl_type_cache, &type_cache) {
@@ -507,7 +507,7 @@ pub fn bind_decl_write(
     // Every write of a local produces its slot, whether its value lands or
     // not, so the local's writers run as one group on every run rather than
     // only those whose value the slot took last time.
-    derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
+    derivation::note_write(|| derivation::FactKey::type_cache(&type_owner));
     // Only a local's own initializer claims its empty slot: a later write that
     // reached it first would hold it just until the initializer answered.
     if db.get_type_index().get_type_cache(&type_owner).is_none()

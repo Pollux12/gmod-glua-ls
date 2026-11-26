@@ -395,7 +395,7 @@ fn find_table_generic_members(
 
     let key_type = ctx.instantiate_type(db, &table_type[0]);
     let value_type = ctx.instantiate_type(db, &table_type[1]);
-    let member_key = LuaMemberKey::ExprType(key_type);
+    let member_key = LuaMemberKey::ExprType(Box::new(key_type));
 
     if should_include_member(&member_key, filter) {
         members.push(LuaMemberInfo {
@@ -1049,7 +1049,7 @@ fn find_global_members(
         }
 
         if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
-            let member_key = LuaMemberKey::Name(decl.get_name().to_string().into());
+            let member_key = LuaMemberKey::name(decl.get_name());
 
             if should_include_member(&member_key, filter) {
                 let raw_type = db
@@ -1112,7 +1112,7 @@ fn find_namespace_members(
     let type_index = db.get_type_index();
     let type_decl_id_map = type_index.find_type_decls(FileId::VIRTUAL, &prefix);
     for (name, type_decl_id) in type_decl_id_map {
-        let member_key = LuaMemberKey::Name(name.clone().into());
+        let member_key = LuaMemberKey::name(name.as_str());
 
         if should_include_member(&member_key, filter) {
             if let Some(type_decl_id) = type_decl_id {
@@ -1261,7 +1261,7 @@ fn append_dynamic_field_names(
         .collect::<HashSet<_>>();
 
     for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name.clone());
+        let member_key = LuaMemberKey::name(field_name.clone());
         if !should_include_member(&member_key, filter) {
             continue;
         }
@@ -1615,7 +1615,7 @@ mod tests {
 
         add_type_decl(&mut db, library_file, type_decl_id.clone());
 
-        let key = LuaMemberKey::Name("value".into());
+        let key = LuaMemberKey::name("value");
         let shared_member = make_member_id(library_file, 1);
         let isolated_member = make_member_id(other_main_file, 2);
         let owner = LuaMemberOwner::Type(type_decl_id.clone());
@@ -1664,7 +1664,7 @@ mod tests {
         let keyed_members = find_members_with_key_in_workspace_for_file(
             &db,
             &LuaType::Ref(type_decl_id),
-            LuaMemberKey::Name("value".into()),
+            LuaMemberKey::name("value"),
             false,
             workspace_a,
             caller_file,
@@ -1697,7 +1697,7 @@ mod tests {
 
         add_type_decl(&mut db, library_file, type_decl_id.clone());
 
-        let key = LuaMemberKey::Name("ctor".into());
+        let key = LuaMemberKey::name("ctor");
         let shared_member = make_member_id(library_file, 1);
         let isolated_member = make_member_id(other_main_file, 2);
         let owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name()));
@@ -1734,7 +1734,7 @@ mod tests {
         let members = find_members_with_key_in_workspace_for_file(
             &db,
             &LuaType::Ref(type_decl_id),
-            LuaMemberKey::Name("ctor".into()),
+            LuaMemberKey::name("ctor"),
             false,
             workspace_a,
             caller_file,
@@ -1752,7 +1752,7 @@ mod tests {
         let mut db = make_db();
         let type_decl_id = LuaTypeDeclId::global("TOOL");
         let member_id = make_member_id(FileId::new(19), 1);
-        let key = LuaMemberKey::Name("BuildCPanel".into());
+        let key = LuaMemberKey::name("BuildCPanel");
         let owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name()));
 
         db.get_member_index_mut().add_member(
@@ -1779,7 +1779,7 @@ mod tests {
     fn find_namespace_members_include_direct_global_path_members() {
         let mut db = make_db();
         let member_id = make_member_id(FileId::new(20), 1);
-        let key = LuaMemberKey::Name("Print".into());
+        let key = LuaMemberKey::name("Print");
         let owner = LuaMemberOwner::GlobalPath(GlobalId::new("marauth.util"));
 
         db.get_member_index_mut().add_member(
@@ -1813,7 +1813,7 @@ mod tests {
         let mut db_reversed = make_db();
         let type_decl_id = LuaTypeDeclId::global("StableSelectionOwner");
         let owner = LuaMemberOwner::Type(type_decl_id.clone());
-        let key = LuaMemberKey::Name("stableField".into());
+        let key = LuaMemberKey::name("stableField");
 
         let first_member = make_member_id(FileId::new(41), 1);
         let second_member = make_member_id(FileId::new(42), 2);
@@ -1888,7 +1888,7 @@ mod tests {
         let other_file = FileId::new(52);
         let type_decl_id = LuaTypeDeclId::global("DynamicOwner");
         let field_name = "dynamicValue";
-        let field_key = LuaMemberKey::Name(field_name.into());
+        let field_key = LuaMemberKey::name(field_name);
         let definition_range = TextRange::new(TextSize::new(10), TextSize::new(11));
         add_type_decl(&mut db, caller_file, type_decl_id.clone());
 
@@ -1967,7 +1967,7 @@ mod tests {
             LuaMemberOwner::Type(type_decl_id.clone()),
             LuaMember::new(
                 declared,
-                LuaMemberKey::Name("declared".into()),
+                LuaMemberKey::name("declared"),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -1994,6 +1994,6 @@ mod tests {
 
         let declared_only = find_structural_members(&db, &prefix).expect("members");
         assert_eq!(declared_only.len(), 1);
-        assert_eq!(declared_only[0].key, LuaMemberKey::Name("declared".into()));
+        assert_eq!(declared_only[0].key, LuaMemberKey::name("declared"));
     }
 }

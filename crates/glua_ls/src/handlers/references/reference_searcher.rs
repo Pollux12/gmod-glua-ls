@@ -885,7 +885,7 @@ fn fuzzy_search_references(
     let fuzzy_references = compilation
         .get_db()
         .get_reference_index()
-        .get_index_references(&LuaMemberKey::Name(name_text.to_string().into()))?;
+        .get_index_references(&LuaMemberKey::name(name_text.to_string()))?;
 
     let mut semantic_cache = HashMap::new();
     for in_filed_syntax_id in fuzzy_references {

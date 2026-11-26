@@ -48,9 +48,6 @@ pub struct LuaCompilation {
     index_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
     scopes: analyzer::ScopesCache,
-    /// Each file's inference memo from the last settled re-analysis, which
-    /// the file's next diagnostics take; the next re-analysis drops the rest.
-    memos: Mutex<rustc_hash::FxHashMap<FileId, LuaInferCache>>,
     /// Whether re-analyses leave worker supersteps' tasks to
     /// [`Self::run_detached_tasks`]; see [`Self::set_detached_tasks`].
     detach_tasks: bool,
@@ -86,7 +83,6 @@ impl LuaCompilation {
             interrupt: Arc::default(),
             index_revision: next_index_revision(),
             scopes: analyzer::ScopesCache::default(),
-            memos: Mutex::default(),
             detach_tasks: false,
         };
 
@@ -96,34 +92,6 @@ impl LuaCompilation {
 
     pub fn get_semantic_model(&'_ self, file_id: FileId) -> Option<SemanticModel<'_>> {
         let cache = LuaInferCache::new(file_id, Default::default());
-        let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
-        Some(SemanticModel::new(
-            file_id,
-            &self.db,
-            cache,
-            self.db.get_file_emmyrc(file_id).clone(),
-            tree.get_chunk_node(),
-        ))
-    }
-
-    /// [`Self::get_semantic_model`] for `file_id`'s diagnostics, starting from
-    /// the memo the last settled re-analysis left for the file.
-    pub(crate) fn get_diagnostic_semantic_model(
-        &'_ self,
-        file_id: FileId,
-    ) -> Option<SemanticModel<'_>> {
-        let memo = self
-            .memos
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&file_id);
-        let cache = match memo {
-            Some(mut cache) => {
-                *cache.config_mut() = Default::default();
-                cache
-            }
-            None => LuaInferCache::new(file_id, Default::default()),
-        };
         let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
         Some(SemanticModel::new(
             file_id,
@@ -163,15 +131,6 @@ impl LuaCompilation {
         self.index_revision = next_index_revision();
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
-        }
-        let memos = std::mem::take(
-            self.memos
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        // Freeing every file's memo takes long enough to hold up the take.
-        if !memos.is_empty() {
-            std::thread::spawn(move || drop(memos));
         }
         let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_staged(&file_ids));
         let reanalysis = self
@@ -226,12 +185,9 @@ impl LuaCompilation {
         let reanalysis = session.take().expect("a re-analysis in progress");
         let reanalysed = reanalysis.finish(&mut self.db);
         self.scopes = reanalysed.scopes;
-        *self
-            .memos
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reanalysed.memos;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
+        crate::release_analysis_caches_with(|| {});
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
     }
 
@@ -262,9 +218,20 @@ impl LuaCompilation {
             if let Some(files) = reanalysis.stale_check_files() {
                 // Checked off the lock, which every freshness question takes.
                 drop(session);
-                let stale = crate::profile::phase("reanalyze: stale diagnostics", || {
+                let mut stale = crate::profile::phase("reanalyze: stale diagnostics", || {
                     analyzer::stale_among(&self.db, files)
                 });
+                let diagnosed = self
+                    .diagnosed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let graph = self.db.reader_graph();
+                stale.retain(|file| {
+                    diagnosed.get(file).is_none_or(|reads| {
+                        reads.file_revision != Some(graph.file_fact_revision(*file))
+                    })
+                });
+                drop(diagnosed);
                 if let Some(reanalysis) = self.session().as_mut() {
                     reanalysis.keep_stale(&self.db, stale);
                 }
@@ -377,7 +344,7 @@ impl LuaCompilation {
         let mut keys = graph
             .derivations()
             .filter(|id| id.kind == DerivationKind::Diagnostics)
-            .flat_map(|id| graph.reads_of(id).map(|key| key.key().clone()))
+            .flat_map(|id| graph.reads_of(id).cloned())
             .collect::<Vec<_>>();
         let diagnosed = self
             .diagnosed
@@ -400,7 +367,7 @@ impl LuaCompilation {
         if derivation::recording() {
             return diagnose();
         }
-        if self.db.get_vfs().get_syntax_tree(&file_id).is_none() {
+        if !self.db.get_vfs().has_file(&file_id) {
             return diagnose();
         }
         let _recording = derivation::begin(DerivationId::diagnostics(file_id));
@@ -410,10 +377,12 @@ impl LuaCompilation {
         let result = diagnose();
         drop(viewed);
         // Fingerprints the engine took stand while nothing writes.
-        let recorded = derivation::end();
+        let mut recorded = derivation::end();
         if result.is_some() {
-            let reads = recorded
-                .into_viewed_reads(self.db.reader_graph(), |key| self.db.fact_fingerprint(key));
+            let graph = self.db.reader_graph();
+            recorded.elide_diagnostic_reads(graph);
+            let mut reads = recorded.into_viewed_reads(graph, |key| self.db.fact_fingerprint(key));
+            reads.file_revision = Some(graph.file_fact_revision(file_id));
             self.diagnosed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -425,21 +394,17 @@ impl LuaCompilation {
     /// Files what diagnostics read since the reader graph last changed, which
     /// names its slots as they stood, before anything changes it.
     fn file_diagnostic_reads(&mut self) {
-        let diagnosed = std::mem::take(
-            self.diagnosed
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        if diagnosed.is_empty() {
+        const DIAGNOSTIC_READS_BATCH: usize = 256;
+        if self
+            .diagnosed
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
             return;
         }
         let _filing = crate::profile::PhaseGuard::new("diagnostic reads");
-        let mut diagnosed = diagnosed
-            .into_iter()
-            .map(|(file_id, reads)| (DerivationId::diagnostics(file_id), reads))
-            .collect::<Vec<_>>();
-        diagnosed.sort_unstable_by_key(|(id, _)| id.file_id);
-        self.db.reader_graph_mut().file_viewed(diagnosed);
+        while self.file_some_diagnostic_reads(DIAGNOSTIC_READS_BATCH) {}
     }
 
     /// Files what the diagnostics of up to `files` files read, as
@@ -467,6 +432,13 @@ impl LuaCompilation {
         let _filing = crate::profile::PhaseGuard::new("diagnostic reads part");
         let more = !diagnosed.is_empty();
         let graph = self.db.reader_graph_mut();
+        if let Some(reanalysis) = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            reanalysis.refresh_filed_diagnostics(&part, graph);
+        }
         if more {
             graph.file_viewed_part(part);
         } else {
@@ -495,7 +467,6 @@ impl LuaCompilation {
             interrupt: Arc::default(),
             index_revision: self.index_revision,
             scopes: self.scopes.clone(),
-            memos: Mutex::default(),
             detach_tasks: self.detach_tasks,
         }
     }
@@ -529,10 +500,6 @@ impl LuaCompilation {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.memos
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
     }
 
     /// Drops the compilation part by part, calling `dropped` with each part's
@@ -545,12 +512,6 @@ impl LuaCompilation {
                 .take(),
         );
         dropped("reanalysis");
-        drop(std::mem::take(
-            self.memos
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        ));
-        dropped("inference memos");
         drop(std::mem::take(
             self.diagnosed
                 .get_mut()

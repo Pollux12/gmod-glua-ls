@@ -704,6 +704,7 @@ impl DiagnosticStore {
         if self.is_idle() {
             crate::util::ls_profile::emit_ls_diagnostics_idle();
             self.idle.notify_one();
+            crate::util::spawn_release_free_memory();
         }
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
@@ -765,6 +766,15 @@ impl DiagnosticStore {
                 .compilation
                 .file_some_diagnostic_reads(FILED_PER_LOCK)
             {
+                let open = self.state().open.clone();
+                let db = analysis.compilation.get_db_mut();
+                let evicted = db.get_vfs_mut().evict_cold_trees(|id| open.contains(id));
+                let released_fp = db.release_fingerprint_cache();
+                drop(analysis);
+                if !evicted.is_empty() || released_fp {
+                    drop(evicted);
+                    crate::util::spawn_release_free_memory();
+                }
                 return;
             }
             drop(analysis);
@@ -831,6 +841,7 @@ impl DiagnosticStore {
             .panic_computes
             .load(std::sync::atomic::Ordering::Acquire);
         let computed = tokio::task::spawn_blocking(move || {
+            let _caches = crate::util::ClearThreadCachesOnDrop::with_heap_sweep();
             #[cfg(test)]
             if panics {
                 panic!("injected diagnostic computation panic");

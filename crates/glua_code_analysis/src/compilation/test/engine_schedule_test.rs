@@ -197,7 +197,7 @@ end
             graph
                 .derivations()
                 .filter(|id| id.file_id == file_ids[2])
-                .filter(|id| graph.reads_of(*id).any(|read| **read == key))
+                .filter(|id| graph.reads_of(*id).any(|read| *read == key))
                 .count()
         };
 
@@ -357,7 +357,7 @@ end
             .derivations_of_file(caller)
             .find(|id| id.kind == DerivationKind::CallSiteParam)
             .expect("caller call-site params");
-        let reads = graph.reads_of(id).map(|key| key.key()).collect::<Vec<_>>();
+        let reads = graph.reads_of(id).collect::<Vec<_>>();
         assert!(reads.contains(&&FactKey::FunctionSummaries(lib)));
         assert!(!reads.contains(&&FactKey::References(lib)));
     }

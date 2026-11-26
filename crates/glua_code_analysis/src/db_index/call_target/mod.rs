@@ -120,41 +120,151 @@ fn unique_signature_id(typ: &LuaType) -> Option<LuaSignatureId> {
     }
 }
 
+/// Compact on-heap representation of [`LuaCallTarget`]. Most calls resolve to
+/// a single signature with no hook callbacks, stored inline in 16 bytes with no
+/// heap allocation (vs 72 bytes + `Vec` allocation for `LuaCallTarget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredCallTarget {
+    Empty,
+    /// `declared == Some(s), unique == Some(s), inferred == [s], hook_callbacks == []`
+    SingleBoth(LuaSignatureId),
+    /// `declared == None, unique == Some(s), inferred == [s], hook_callbacks == []`
+    SingleInferred(LuaSignatureId),
+    /// `declared == Some(s), unique == None, inferred == [], hook_callbacks == []`
+    SingleDeclared(LuaSignatureId),
+    General(Box<LuaCallTarget>),
+}
+
+const _: () = assert!(std::mem::size_of::<StoredCallTarget>() == 16);
+
+impl StoredCallTarget {
+    fn from_target(target: LuaCallTarget) -> Self {
+        if target.hook_callbacks.is_empty() {
+            match (target.declared, target.unique, target.inferred.as_slice()) {
+                (None, None, []) => return Self::Empty,
+                (Some(s), Some(u), [i]) if s == u && s == *i => return Self::SingleBoth(s),
+                (None, Some(u), [i]) if u == *i => return Self::SingleInferred(u),
+                (Some(s), None, []) => return Self::SingleDeclared(s),
+                _ => {}
+            }
+        }
+        Self::General(Box::new(target))
+    }
+
+    fn to_target(&self) -> LuaCallTarget {
+        match self {
+            Self::Empty => LuaCallTarget::default(),
+            Self::SingleBoth(s) => LuaCallTarget {
+                declared: Some(*s),
+                inferred: vec![*s],
+                unique: Some(*s),
+                hook_callbacks: Vec::new(),
+            },
+            Self::SingleInferred(s) => LuaCallTarget {
+                declared: None,
+                inferred: vec![*s],
+                unique: Some(*s),
+                hook_callbacks: Vec::new(),
+            },
+            Self::SingleDeclared(s) => LuaCallTarget {
+                declared: Some(*s),
+                inferred: Vec::new(),
+                unique: None,
+                hook_callbacks: Vec::new(),
+            },
+            Self::General(target) => (**target).clone(),
+        }
+    }
+
+    fn visit_signature_ids(&self, mut f: impl FnMut(LuaSignatureId)) {
+        match self {
+            Self::Empty => {}
+            Self::SingleBoth(s) => {
+                f(*s);
+                f(*s);
+                f(*s);
+            }
+            Self::SingleInferred(s) => {
+                f(*s);
+                f(*s);
+            }
+            Self::SingleDeclared(s) => f(*s),
+            Self::General(target) => {
+                for &s in target.signature_ids() {
+                    f(s);
+                }
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for StoredCallTarget {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Empty => {
+                Option::<LuaSignatureId>::None.hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+                Option::<LuaSignatureId>::None.hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+            }
+            Self::SingleBoth(s) => {
+                Some(*s).hash(state);
+                std::slice::from_ref(s).hash(state);
+                Some(*s).hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+            }
+            Self::SingleInferred(s) => {
+                Option::<LuaSignatureId>::None.hash(state);
+                std::slice::from_ref(s).hash(state);
+                Some(*s).hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+            }
+            Self::SingleDeclared(s) => {
+                Some(*s).hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+                Option::<LuaSignatureId>::None.hash(state);
+                (&[] as &[LuaSignatureId]).hash(state);
+            }
+            Self::General(target) => target.hash(state),
+        }
+    }
+}
+
 /// One file's call targets, by call range, and how many signature ids they
 /// name in each file.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FileCallTargets {
-    targets: FxHashMap<TextRange, LuaCallTarget>,
+    targets: FxHashMap<TextRange, StoredCallTarget>,
     named: FxHashMap<FileId, usize>,
 }
 
 impl FileCallTargets {
     /// Counts the signatures `target` names, adding to `linked` each file
     /// named for the first time.
-    fn name(&mut self, target: &LuaCallTarget, linked: &mut Vec<FileId>) {
-        for signature_id in target.signature_ids() {
+    fn name(&mut self, target: &StoredCallTarget, linked: &mut Vec<FileId>) {
+        target.visit_signature_ids(|signature_id| {
             let count = self.named.entry(signature_id.get_file_id()).or_default();
             *count += 1;
             if *count == 1 {
                 linked.push(signature_id.get_file_id());
             }
-        }
+        });
     }
 
     /// Uncounts the signatures `target` names, adding to `unlinked` each file
     /// no target names any more.
-    fn unname(&mut self, target: &LuaCallTarget, unlinked: &mut Vec<FileId>) {
-        for signature_id in target.signature_ids() {
+    fn unname(&mut self, target: &StoredCallTarget, unlinked: &mut Vec<FileId>) {
+        target.visit_signature_ids(|signature_id| {
             let file_id = signature_id.get_file_id();
             let Some(count) = self.named.get_mut(&file_id) else {
-                continue;
+                return;
             };
             *count -= 1;
             if *count == 0 {
                 self.named.remove(&file_id);
                 unlinked.push(file_id);
             }
-        }
+        });
     }
 }
 
@@ -173,10 +283,11 @@ impl LuaCallTargetIndex {
     /// Stores what the call at `range` of `file_id` targets.
     pub fn set_target(&mut self, file_id: FileId, range: TextRange, target: LuaCallTarget) {
         derivation::note_write(|| FactKey::CallTarget(InFiled::new(file_id, range)));
+        let stored = StoredCallTarget::from_target(target);
         let held = Arc::make_mut(self.files.entry(file_id).or_default());
         let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
-        held.name(&target, &mut linked);
-        if let Some(previous) = held.targets.insert(range, target) {
+        held.name(&stored, &mut linked);
+        if let Some(previous) = held.targets.insert(range, stored) {
             held.unname(&previous, &mut unlinked);
         }
         self.relink(file_id, linked, unlinked);
@@ -199,9 +310,13 @@ impl LuaCallTargetIndex {
     }
 
     /// What the call at `range` of `file_id` targets.
-    pub fn target(&self, file_id: FileId, range: TextRange) -> Option<&LuaCallTarget> {
+    pub fn target(&self, file_id: FileId, range: TextRange) -> Option<LuaCallTarget> {
         derivation::note_read(|| FactKey::CallTarget(InFiled::new(file_id, range)));
-        self.files.get(&file_id)?.targets.get(&range)
+        self.files
+            .get(&file_id)?
+            .targets
+            .get(&range)
+            .map(StoredCallTarget::to_target)
     }
 
     /// Drops what the call at `range` of `file_id` targets, before the
@@ -244,8 +359,8 @@ impl LuaCallTargetIndex {
                 continue;
             };
             let mut moved = Vec::new();
-            for (range, target) in &held.targets {
-                let mut remapped = target.clone();
+            for (range, stored) in &held.targets {
+                let mut remapped = stored.to_target();
                 let mut changed = false;
                 let mut named_lost = false;
                 for signature_id in remapped.signature_ids_mut() {
@@ -302,7 +417,7 @@ impl LuaCallTargetIndex {
 
 fn targets_fingerprint(
     file_id: FileId,
-    targets: &FxHashMap<TextRange, LuaCallTarget>,
+    targets: &FxHashMap<TextRange, StoredCallTarget>,
 ) -> Fingerprint {
     derivation::in_file(Some(file_id), || {
         targets
@@ -349,11 +464,13 @@ mod tests {
     fn assert_referencing_matches_a_scan(index: &LuaCallTargetIndex) {
         let mut expected: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
         for (holder, held) in index.files.iter() {
-            for signature_id in held.targets.values().flat_map(LuaCallTarget::signature_ids) {
-                expected
-                    .entry(signature_id.get_file_id())
-                    .or_default()
-                    .insert(*holder);
+            for target in held.targets.values() {
+                target.visit_signature_ids(|signature_id| {
+                    expected
+                        .entry(signature_id.get_file_id())
+                        .or_default()
+                        .insert(*holder);
+                });
             }
         }
         let indexed: FxHashMap<_, _> = index

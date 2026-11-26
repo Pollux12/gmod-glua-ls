@@ -4,6 +4,7 @@ use crate::FileId;
 use crate::db_index::derivation::FilePosition;
 use crate::{LuaMemberId, LuaSignatureId};
 use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr};
+use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
@@ -11,7 +12,7 @@ use super::decl_id::LuaDeclId;
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct LuaDecl {
-    name: SmolStr,
+    name: ArcIntern<SmolStr>,
     file_id: FileId,
     range: TextRange,
     expr_id: Option<LuaSyntaxId>,
@@ -21,7 +22,7 @@ pub struct LuaDecl {
 
 impl Hash for LuaDecl {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+        self.name.as_str().hash(state);
         self.file_id.hash(state);
         self.range.hash_in_file(self.file_id, state);
         self.expr_id.is_some().hash(state);
@@ -92,7 +93,7 @@ impl LuaDecl {
         expr_id: Option<LuaSyntaxId>,
     ) -> Self {
         Self {
-            name: SmolStr::new(name),
+            name: crate::db_index::intern_smol_str(name),
             file_id,
             range,
             expr_id,
@@ -110,7 +111,11 @@ impl LuaDecl {
     }
 
     pub fn get_name(&self) -> &str {
-        &self.name
+        self.name.as_str()
+    }
+
+    pub(crate) fn interned_name(&self) -> ArcIntern<SmolStr> {
+        self.name.clone()
     }
 
     pub fn get_position(&self) -> TextSize {

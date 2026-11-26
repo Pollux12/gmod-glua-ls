@@ -484,7 +484,7 @@ fn remove_fields_supplied_by_metatable(
             .strip_prefix('[')
             .and_then(|index| index.strip_suffix(']'))
             .and_then(|index| index.parse::<i64>().ok())
-            .map_or_else(|| LuaMemberKey::Name((*name).into()), LuaMemberKey::Integer);
+            .map_or_else(|| LuaMemberKey::name(*name), LuaMemberKey::Integer);
         matches!(
             find_metatable_index_field(db, &table, &key),
             MetatableIndexField::Absent

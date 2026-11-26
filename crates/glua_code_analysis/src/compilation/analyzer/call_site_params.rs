@@ -725,8 +725,8 @@ fn collect_call_site_param_types(
             Some(LuaCallTarget {
                 declared: Some(signature_id),
                 ..
-            }) => signature_ids.push(*signature_id),
-            Some(target) => signature_ids.clone_from(&target.inferred),
+            }) => signature_ids.push(signature_id),
+            Some(target) => signature_ids = target.inferred,
             None => {}
         }
     }
@@ -1256,8 +1256,8 @@ fn exact_receiver_key_has_candidate(db: &DbIndex, member_key: &LuaMemberKey) -> 
 
 fn exact_receiver_member_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<LuaMemberKey> {
     match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
-        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::name(name.get_name_text())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::name(string.get_value())),
         _ => None,
     }
 }
@@ -1530,13 +1530,13 @@ fn signature_ids_from_call_prefix(
         && is_local_callee
         && is_unwritten_alias(db, file_id, name_expr, call_position)
         && let Some(signature_id) = super::call_target::call_target_of(db, file_id, call_expr)
-            .and_then(LuaCallTarget::signature_id)
+            .and_then(|target| target.signature_id())
     {
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
     let mut signature_ids = super::call_target::call_target_of(db, file_id, call_expr)
-        .map(|target| target.inferred.clone())
+        .map(|target| target.inferred)
         .unwrap_or_default();
     let mut lookup_kind = SignatureLookupKind::InferredCallable;
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
@@ -1793,7 +1793,7 @@ fn member_history_item(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaMember
     let history_item = match historical_ids.as_slice() {
         [] => return None,
         [member_id] => LuaMemberIndexItem::One(*member_id),
-        _ => LuaMemberIndexItem::Many(historical_ids),
+        _ => LuaMemberIndexItem::Many(historical_ids.into_boxed_slice()),
     };
     Some(history_item)
 }

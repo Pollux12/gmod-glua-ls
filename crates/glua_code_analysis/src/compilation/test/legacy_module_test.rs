@@ -102,7 +102,7 @@ config = { enabled = true }
 ",
         );
 
-        let key = LuaMemberKey::Name("enabled".into());
+        let key = LuaMemberKey::name("enabled");
         let counts = ["config", "mymod.config"].map(|path| {
             ws.analysis
                 .compilation
@@ -157,7 +157,7 @@ config = { enabled = true }
         );
 
         let owner = LuaMemberOwner::GlobalPath(GlobalId::new("class"));
-        let key = LuaMemberKey::Name("Value".into());
+        let key = LuaMemberKey::name("Value");
         let member_count = ws
             .analysis
             .compilation

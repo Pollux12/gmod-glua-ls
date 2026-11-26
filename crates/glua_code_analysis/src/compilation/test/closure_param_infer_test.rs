@@ -1416,7 +1416,7 @@ mod test {
         let inherited_members = find_members_with_key_in_workspace_for_file(
             ws.analysis.compilation.get_db(),
             &LuaType::Ref(LuaTypeDeclId::global("WorkspaceBase")),
-            LuaMemberKey::Name("Run".into()),
+            LuaMemberKey::name("Run"),
             false,
             caller_workspace_id,
             caller_file_id,

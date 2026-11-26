@@ -40,6 +40,23 @@ impl<T> Paged<T> {
         self.len - 1
     }
 
+    pub(super) fn resize_with(&mut self, new_len: usize, mut f: impl FnMut() -> T) {
+        while self.len < new_len {
+            if self.len == self.capacity() {
+                self.pages.push(Vec::with_capacity(PAGE));
+            }
+            let page = self.pages.last_mut().expect("a page with room");
+            let take = (new_len - self.len).min(PAGE - page.len());
+            page.resize_with(page.len() + take, &mut f);
+            self.len += take;
+        }
+    }
+
+    pub(super) fn clear_and_free(&mut self) {
+        self.pages = Vec::new();
+        self.len = 0;
+    }
+
     pub(super) fn get(&self, index: usize) -> Option<&T> {
         (index < self.len).then(|| &self[index])
     }

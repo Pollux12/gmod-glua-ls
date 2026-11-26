@@ -28,13 +28,6 @@ mod test {
                 state.push(format!("direct {owner:?} {name} {definitions:?}"));
             }
         }
-        for (owner, fields) in index.iter_all_owner_fields() {
-            for (name, files) in fields {
-                let mut files = files.iter().copied().collect::<Vec<_>>();
-                files.sort_unstable();
-                state.push(format!("files {owner:?} {name} {files:?}"));
-            }
-        }
         for (name, sites) in index.iter_all_unattributed_fields() {
             let mut sites = sites.iter().cloned().collect::<Vec<_>>();
             sites.sort_by_key(|site| (site.file_id, site.value.start()));
@@ -164,7 +157,7 @@ e[key] = 4
         ws.def_file(LIB_FILE, "YLib = {}\n");
         let sites = ws.def_file(SITES_FILE, SITES);
         // `x` is declared at offset 6, after `local `.
-        let x = FactKey::TypeCache(LuaTypeOwner::Decl(LuaDeclId::new(
+        let x = FactKey::type_cache(&LuaTypeOwner::Decl(LuaDeclId::new(
             sites,
             rowan::TextSize::new(6),
         )));
@@ -174,7 +167,7 @@ e[key] = 4
                 .get_db()
                 .reader_graph()
                 .reads_of(site)
-                .any(|key| *key.key() == x)
+                .any(|key| *key == x)
         };
 
         assert_eq!(

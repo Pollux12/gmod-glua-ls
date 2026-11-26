@@ -397,7 +397,7 @@ fn is_hook_signature(
     crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
         db,
         &LuaType::Ref(owner.clone()),
-        LuaMemberKey::Name(name.get_name_text().into()),
+        LuaMemberKey::name(name.get_name_text()),
         true,
         workspace_id,
         file_id,

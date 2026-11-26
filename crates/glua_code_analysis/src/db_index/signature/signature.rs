@@ -1,11 +1,13 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::hash_map;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
 use rowan::{TextRange, TextSize};
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 use crate::db_index::signature::async_state::AsyncState;
@@ -26,7 +28,7 @@ pub const OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE: &str = "overload_call_arg_field";
 pub struct LuaSignature {
     pub generic_params: Vec<Arc<LuaGenericParamInfo>>,
     pub overloads: Vec<Arc<LuaFunctionType>>,
-    pub param_docs: HashMap<usize, LuaDocParamInfo>,
+    pub param_docs: ParamDocs,
     pub out_params: Vec<LuaOutParamInfo>,
     pub params: Vec<SmolStr>,
     pub return_docs: Vec<LuaDocReturnInfo>,
@@ -50,7 +52,50 @@ pub struct LuaSignature {
     pub return_filled_from_slot: bool,
     /// The facts few signatures carry; `None` exactly when all are empty.
     facts: Option<Box<SignatureFacts>>,
-    pub return_cast: Option<super::LuaSignatureCast>,
+    pub return_cast: Option<Box<super::LuaSignatureCast>>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub struct ParamDocs(Option<Box<FxHashMap<usize, LuaDocParamInfo>>>);
+
+impl ParamDocs {
+    pub fn get(&self, index: &usize) -> Option<&LuaDocParamInfo> {
+        self.0.as_deref()?.get(index)
+    }
+
+    pub fn get_mut(&mut self, index: &usize) -> Option<&mut LuaDocParamInfo> {
+        self.0.as_deref_mut()?.get_mut(index)
+    }
+
+    pub fn insert(&mut self, index: usize, info: LuaDocParamInfo) -> Option<LuaDocParamInfo> {
+        self.0.get_or_insert_default().insert(index, info)
+    }
+
+    pub fn contains_key(&self, index: &usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.as_deref().map_or(0, FxHashMap::len)
+    }
+
+    pub fn iter(&self) -> hash_map::Iter<'_, usize, LuaDocParamInfo> {
+        self.0.as_deref().map(FxHashMap::iter).unwrap_or_default()
+    }
+
+    pub fn values(&self) -> hash_map::Values<'_, usize, LuaDocParamInfo> {
+        self.0.as_deref().map(FxHashMap::values).unwrap_or_default()
+    }
+}
+
+impl fmt::Debug for ParamDocs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
 }
 
 /// Parameter/return relations inferred from a function body.
@@ -192,7 +237,7 @@ impl LuaSignature {
         Self {
             generic_params: Vec::new(),
             overloads: Vec::new(),
-            param_docs: HashMap::new(),
+            param_docs: ParamDocs::default(),
             out_params: Vec::new(),
             params: Vec::new(),
             return_docs: Vec::new(),
@@ -408,7 +453,7 @@ impl LuaSignature {
 
     pub fn call_arg_roles(&self) -> Vec<LuaCallArgRole> {
         let mut roles = Vec::new();
-        for (param_idx, param_info) in &self.param_docs {
+        for (param_idx, param_info) in self.param_docs.iter() {
             visit_call_arg_roles_from_param_attribute(*param_idx, param_info, &mut |role| {
                 roles.push(role.clone());
             });
@@ -698,7 +743,7 @@ impl LuaSignature {
 
         let mut new_param_types: std::collections::HashMap<usize, LuaType> =
             std::collections::HashMap::new();
-        for (idx, info) in &self.param_docs {
+        for (idx, info) in self.param_docs.iter() {
             let result = crate::db_index::remap_identities_in_type(&info.type_ref, remap);
             if result.lost {
                 lost = true;

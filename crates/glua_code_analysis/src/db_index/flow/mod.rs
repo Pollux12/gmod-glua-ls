@@ -1,4 +1,6 @@
 mod flow_node;
+
+use super::SiteList;
 mod flow_tree;
 
 use crate::db_index::cow_shards::{CowCell, CowShards};
@@ -16,7 +18,8 @@ use crate::{
 };
 pub use flow_node::*;
 pub use flow_tree::{
-    AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, FileNarrowingCapability, FlowTree,
+    AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, CompactNameSet,
+    FileNarrowingCapability, FlowTree,
 };
 
 use super::traits::LuaIndex;
@@ -26,7 +29,7 @@ pub struct LuaFlowIndex {
     file_flow_tree: CowCell<HashMap<FileId, FlowTree>>,
     /// [`FlowTree::content_fingerprint`] of each stored tree.
     flow_tree_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
-    special_call_effects: CowShards<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
+    special_call_effects: CowShards<FileId, HashMap<TextSize, SiteList<LuaSpecialCallEffect>>>,
     /// Every special-call fact installed, by the call site that installed it.
     /// One call-site can install several facts (a synthesized class plus its
     /// super edge, say), and several call-sites can install facts for the same
@@ -255,7 +258,7 @@ impl LuaFlowIndex {
         self.special_call_effects
             .get(file_id)?
             .get(&position)
-            .map(|effects| effects.as_slice())
+            .map(|effects| &**effects)
     }
 
     pub fn special_call_effects(
@@ -294,7 +297,7 @@ impl LuaFlowIndex {
     /// Whether a special-call effect of `file_id` narrows `var_ref_id`: the
     /// flow walk's special calls change nothing else about it.
     pub fn has_special_call_effect_for(&self, file_id: &FileId, var_ref_id: &VarRefId) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, var_ref_id.clone()));
+        derivation::note_read(|| FactKey::special_call_for(*file_id, var_ref_id.clone()));
         self.effects_in(file_id)
             .any(|(_, effect)| effect.narrows(var_ref_id))
     }
@@ -305,7 +308,7 @@ impl LuaFlowIndex {
         position: TextSize,
         target: &VarRefId,
     ) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, target.clone()));
+        derivation::note_read(|| FactKey::special_call_for(*file_id, target.clone()));
         self.effects_in(file_id).any(|(effect_position, effect)| {
             *effect_position < position && &effect.target == target
         })
@@ -331,7 +334,10 @@ impl LuaFlowIndex {
                         effects
                             .iter()
                             .map(|(position, entries)| {
-                                derivation::fingerprint_of(&(derivation::Local(position), entries))
+                                derivation::fingerprint_of(&(
+                                    derivation::Local(position),
+                                    &**entries,
+                                ))
                             })
                             .fold(0u64, u64::wrapping_add)
                             .max(1)
@@ -364,7 +370,7 @@ impl LuaFlowIndex {
                 if effects.is_none() && facts == 0 {
                     return derivation::ABSENT;
                 }
-                derivation::fingerprint_of(&(effects, facts))
+                derivation::fingerprint_of(&(effects.map(|entries| &**entries), facts))
             }
             _ => {
                 debug_assert!(false, "{key:?} is not a flow fact");
@@ -812,7 +818,7 @@ mod tests {
             )
         };
         let mut index = LuaFlowIndex::new();
-        let key = FactKey::SpecialCallFor(file_id, field(0));
+        let key = FactKey::special_call_for(file_id, field(0));
         let seen = derivation::in_file(Some(file_id), || index.fact_fingerprint(&key));
         assert_eq!(seen, derivation::ABSENT);
 
@@ -853,9 +859,9 @@ mod tests {
             file_id,
             crate::PositionMap::new(text, &format!("\n{text}")),
         )]);
-        let key = FactKey::SpecialCallFor(file_id, target(4));
+        let key = FactKey::special_call_for(file_id, target(4));
         let moved = edits.map_key(&key).expect("the shift loses no position");
-        assert_eq!(moved, FactKey::SpecialCallFor(file_id, target(5)));
+        assert_eq!(moved, FactKey::special_call_for(file_id, target(5)));
 
         let seen = derivation::in_file(Some(file_id), || before.fact_fingerprint(&key));
         let held = derivation::fingerprint_before_edits(&edits, || {

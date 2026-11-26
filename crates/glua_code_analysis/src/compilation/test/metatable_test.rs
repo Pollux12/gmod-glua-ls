@@ -539,13 +539,13 @@ mod test {
         assert!(
             members
                 .iter()
-                .any(|member| member.get_key() == &LuaMemberKey::Name("Func".into())),
+                .any(|member| member.get_key() == &LuaMemberKey::name("Func")),
             "expected Func to be transferred to class owner, got {members:#?}"
         );
         assert!(
             members
                 .iter()
-                .any(|member| member.get_key() == &LuaMemberKey::Name("Panel".into())),
+                .any(|member| member.get_key() == &LuaMemberKey::name("Panel")),
             "expected Panel to be transferred to class owner, got {members:#?}"
         );
     }

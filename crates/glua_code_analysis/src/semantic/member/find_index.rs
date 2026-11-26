@@ -79,7 +79,7 @@ fn find_index_table(db: &DbIndex, table_range: &InFiled<TextRange>) -> FindMembe
                     if let Ok(return_type) = operator.get_result(db) {
                         members.push(LuaMemberInfo {
                             property_owner_id: None,
-                            key: LuaMemberKey::ExprType(operand),
+                            key: LuaMemberKey::ExprType(Box::new(operand)),
                             typ: return_type,
                             feature: None,
                             overload_index: None,
@@ -105,7 +105,7 @@ fn find_index_table(db: &DbIndex, table_range: &InFiled<TextRange>) -> FindMembe
 
                 members.push(LuaMemberInfo {
                     property_owner_id: Some(LuaSemanticDeclId::Member(member.get_id())),
-                    key: LuaMemberKey::ExprType(member_key_type),
+                    key: LuaMemberKey::ExprType(Box::new(member_key_type)),
                     typ: member_type,
                     feature: Some(member.get_feature()),
                     overload_index: None,
@@ -151,7 +151,7 @@ fn find_index_custom_type(
                 if let Ok(return_type) = operator.get_result(db) {
                     members.push(LuaMemberInfo {
                         property_owner_id: None,
-                        key: LuaMemberKey::ExprType(operand),
+                        key: LuaMemberKey::ExprType(Box::new(operand)),
                         typ: return_type,
                         feature: None,
                         overload_index: None,
@@ -193,7 +193,7 @@ fn find_index_array(db: &DbIndex, file_id: Option<FileId>, base: &LuaType) -> Fi
     // Array accepts integer indices
     members.push(LuaMemberInfo {
         property_owner_id: None,
-        key: LuaMemberKey::ExprType(LuaType::Integer),
+        key: LuaMemberKey::ExprType(Box::new(LuaType::Integer)),
         typ: expression_type.clone(),
         feature: None,
         overload_index: None,
@@ -202,7 +202,7 @@ fn find_index_array(db: &DbIndex, file_id: Option<FileId>, base: &LuaType) -> Fi
     // Array accepts number indices (for compatibility)
     members.push(LuaMemberInfo {
         property_owner_id: None,
-        key: LuaMemberKey::ExprType(LuaType::Number),
+        key: LuaMemberKey::ExprType(Box::new(LuaType::Number)),
         typ: expression_type,
         feature: None,
         overload_index: None,
@@ -219,7 +219,7 @@ fn find_index_object(db: &DbIndex, object: &LuaObjectType) -> FindMembersResult 
     for (key, field) in access_member_type {
         members.push(LuaMemberInfo {
             property_owner_id: None,
-            key: LuaMemberKey::ExprType(key.clone()),
+            key: LuaMemberKey::ExprType(Box::new(key.clone())),
             typ: field.clone(),
             feature: None,
             overload_index: None,
@@ -378,7 +378,7 @@ fn find_index_generic(
 
                     members.push(LuaMemberInfo {
                         property_owner_id: None,
-                        key: LuaMemberKey::ExprType(instantiated_operand),
+                        key: LuaMemberKey::ExprType(Box::new(instantiated_operand)),
                         typ: instantiated_return_type,
                         feature: None,
                         overload_index: None,
@@ -419,7 +419,7 @@ fn find_index_table_generic(db: &DbIndex, table_params: &[LuaType]) -> FindMembe
 
     members.push(LuaMemberInfo {
         property_owner_id: None,
-        key: LuaMemberKey::ExprType(key_type.clone()),
+        key: LuaMemberKey::ExprType(Box::new(key_type.clone())),
         typ: value_type.clone(),
         feature: None,
         overload_index: None,
@@ -515,7 +515,7 @@ impl IndexLookup<'_> {
         };
         if let Some(index_item) = db.get_member_index().get_member_item(
             &crate::semantic::metatable_member_owner(db, metatable),
-            &LuaMemberKey::Name("__index".into()),
+            &LuaMemberKey::name("__index"),
         ) {
             let Ok(index_type) = index_item.resolve_type(db) else {
                 self.add(MetatableIndexField::Unknown);

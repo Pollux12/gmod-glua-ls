@@ -14,8 +14,8 @@ pub struct LuaOwnerMembers {
     // `members` is private and these four mutators are the complete id-set
     // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
     // `remove_member`.
-    sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
-    sorted_expr_ids_cache: OnceLock<Vec<LuaMemberId>>,
+    sorted_ids_cache: OnceLock<Box<[LuaMemberId]>>,
+    sorted_expr_ids_cache: OnceLock<Box<[LuaMemberId]>>,
     resolve_state: OwnerMemberStatus,
     /// Wrapping sum of [`listed_id_fingerprint`] over every listed
     /// `(key, id)`. `add_member`, `remove_member` and `remove_id` keep it;
@@ -44,8 +44,7 @@ fn merge_item(
     fn ids(item: Option<&LuaMemberIndexItem>) -> Vec<LuaMemberId> {
         match item {
             None => Vec::new(),
-            Some(LuaMemberIndexItem::One(id)) => vec![*id],
-            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
+            Some(item) => item.get_member_ids(),
         }
     }
     let (frozen, fork) = (ids(frozen), ids(fork));
@@ -60,7 +59,7 @@ fn merge_item(
     *current = match merged.as_slice() {
         [] => None,
         [id] => Some(LuaMemberIndexItem::One(*id)),
-        _ => Some(LuaMemberIndexItem::Many(merged)),
+        _ => Some(LuaMemberIndexItem::Many(merged.into_boxed_slice())),
     };
     Ok(())
 }
@@ -231,7 +230,7 @@ impl LuaOwnerMembers {
 
     pub fn sorted_member_ids(&self) -> &[LuaMemberId] {
         self.sorted_ids_cache.get_or_init(|| {
-            let mut member_ids = Vec::new();
+            let mut member_ids = Vec::with_capacity(self.members.len());
             for item in self.members.values() {
                 match item {
                     LuaMemberIndexItem::One(id) => member_ids.push(*id),
@@ -239,7 +238,7 @@ impl LuaOwnerMembers {
                 }
             }
             member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
-            member_ids
+            member_ids.into_boxed_slice()
         })
     }
 
@@ -250,7 +249,7 @@ impl LuaOwnerMembers {
                 member_ids.extend_from_slice(item.member_ids_slice());
             }
             member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
-            member_ids
+            member_ids.into_boxed_slice()
         })
     }
 
@@ -318,10 +317,7 @@ mod tests {
     fn owner_with(entries: &[(&str, LuaMemberId)]) -> LuaOwnerMembers {
         let mut members = LuaOwnerMembers::new();
         for (name, id) in entries {
-            members.add_member(
-                LuaMemberKey::Name((*name).into()),
-                LuaMemberIndexItem::One(*id),
-            );
+            members.add_member(LuaMemberKey::name(*name), LuaMemberIndexItem::One(*id));
         }
         members
     }
@@ -355,13 +351,13 @@ mod tests {
 
     #[test]
     fn tasks_changing_one_key_merge_the_ids_listed_under_it() {
-        let key = LuaMemberKey::Name("a".into());
+        let key = LuaMemberKey::name("a");
         let item = |ids: &[LuaMemberId]| {
             let mut ids = ids.to_vec();
             ids.sort_by_key(|id| member_id_sort_key(*id));
             match ids.as_slice() {
                 [id] => LuaMemberIndexItem::One(*id),
-                _ => LuaMemberIndexItem::Many(ids),
+                _ => LuaMemberIndexItem::Many(ids.into_boxed_slice()),
             }
         };
         let owner = |ids: &[LuaMemberId]| {
@@ -415,8 +411,8 @@ mod tests {
 
     #[test]
     fn sorted_expression_member_ids_follow_every_mutation_path() {
-        let expr_key = LuaMemberKey::ExprType(crate::LuaType::String);
-        let second_expr_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
+        let expr_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
+        let second_expr_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::Integer));
         let first = member_id(2, 20);
         let second = member_id(1, 10);
         let third = member_id(3, 30);
@@ -427,7 +423,7 @@ mod tests {
 
         members.add_member(
             expr_key.clone(),
-            LuaMemberIndexItem::Many(vec![first, second]),
+            LuaMemberIndexItem::Many(Box::new([first, second])),
         );
         assert_eq!(members.sorted_expr_key_member_ids(), &[second, first]);
 
@@ -452,7 +448,7 @@ mod tests {
 
     #[test]
     fn an_expr_key_kept_by_the_merge_still_lists_its_members() {
-        let key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let key = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
         let (kept, dropped) = (member_id(1, 1), member_id(2, 2));
         let owner = |item: LuaMemberIndexItem| {
             let mut members = LuaOwnerMembers::new();
@@ -460,7 +456,7 @@ mod tests {
             members
         };
         let frozen = owner(LuaMemberIndexItem::One(dropped));
-        let current = owner(LuaMemberIndexItem::Many(vec![kept, dropped]));
+        let current = owner(LuaMemberIndexItem::Many(Box::new([kept, dropped])));
         let fork = LuaOwnerMembers::new();
 
         let merged = merge_owner(Some(&current), Some(&frozen), Some(&fork))

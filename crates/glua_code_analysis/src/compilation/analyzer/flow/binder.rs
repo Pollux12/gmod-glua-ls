@@ -76,7 +76,10 @@ pub struct FlowBinder<'a> {
     cast_or_implfunc_count: u32,
     condition_count: u32,
     // File-wide narrowing capability (which names/paths can be narrowed).
-    narrowing_capability: FileNarrowingCapability,
+    narrowing_names: rustc_hash::FxHashSet<ArcIntern<SmolStr>>,
+    narrowing_index_paths: rustc_hash::FxHashSet<ArcIntern<SmolStr>>,
+    has_opaque_name_target: bool,
+    has_opaque_index_target: bool,
     narrowing_events: Vec<NarrowingEvent>,
 }
 
@@ -108,7 +111,10 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: 0,
             cast_or_implfunc_count: 0,
             condition_count: 0,
-            narrowing_capability: FileNarrowingCapability::default(),
+            narrowing_names: rustc_hash::FxHashSet::default(),
+            narrowing_index_paths: rustc_hash::FxHashSet::default(),
+            has_opaque_name_target: false,
+            has_opaque_index_target: false,
             narrowing_events: Vec::new(),
         };
 
@@ -145,7 +151,6 @@ impl<'a> FlowBinder<'a> {
 
         let id = FlowId(self.flow_nodes.len() as u32);
         let flow_node = FlowNode {
-            id,
             kind,
             antecedent: None,
         };
@@ -315,7 +320,10 @@ impl<'a> FlowBinder<'a> {
         snap: ModificationSnapshot,
         include_conditions: bool,
     ) -> FileNarrowingCapability {
-        let mut capability = FileNarrowingCapability::default();
+        let mut names = Vec::new();
+        let mut index_paths = Vec::new();
+        let mut has_opaque_name = false;
+        let mut has_opaque_index = false;
         for event in self
             .narrowing_events
             .iter()
@@ -323,21 +331,18 @@ impl<'a> FlowBinder<'a> {
             .filter(|event| include_conditions || !event.from_condition)
         {
             match &event.target {
-                NarrowingTarget::Name(name) => {
-                    capability.referenced_names.insert(name.clone());
-                }
-                NarrowingTarget::IndexPath(path) => {
-                    capability.referenced_index_paths.insert(path.clone());
-                }
-                NarrowingTarget::OpaqueName => {
-                    capability.has_opaque_name_target = true;
-                }
-                NarrowingTarget::OpaqueIndex => {
-                    capability.has_opaque_index_target = true;
-                }
+                NarrowingTarget::Name(name) => names.push(name.clone()),
+                NarrowingTarget::IndexPath(path) => index_paths.push(path.clone()),
+                NarrowingTarget::OpaqueName => has_opaque_name = true,
+                NarrowingTarget::OpaqueIndex => has_opaque_index = true,
             }
         }
-        capability
+        FileNarrowingCapability::from_parts(
+            crate::db_index::CompactNameSet::from_vec(names),
+            crate::db_index::CompactNameSet::from_vec(index_paths),
+            has_opaque_name,
+            has_opaque_index,
+        )
     }
 
     /// Record merge-skip metadata for a BranchLabel created by an if/elseif/else.
@@ -450,27 +455,23 @@ impl<'a> FlowBinder<'a> {
 
     fn record_name(&mut self, name: &str, from_condition: bool) {
         let name = crate::db_index::intern_smol_str(name);
-        self.narrowing_capability
-            .referenced_names
-            .insert(name.clone());
+        self.narrowing_names.insert(name.clone());
         self.push_narrowing_event(NarrowingTarget::Name(name), from_condition);
     }
 
     fn record_index_path(&mut self, path: &str, from_condition: bool) {
         let path = crate::db_index::intern_smol_str(path);
-        self.narrowing_capability
-            .referenced_index_paths
-            .insert(path.clone());
+        self.narrowing_index_paths.insert(path.clone());
         self.push_narrowing_event(NarrowingTarget::IndexPath(path), from_condition);
     }
 
     fn record_opaque_name(&mut self, from_condition: bool) {
-        self.narrowing_capability.has_opaque_name_target = true;
+        self.has_opaque_name_target = true;
         self.push_narrowing_event(NarrowingTarget::OpaqueName, from_condition);
     }
 
     fn record_opaque_index(&mut self, from_condition: bool) {
-        self.narrowing_capability.has_opaque_index_target = true;
+        self.has_opaque_index_target = true;
         self.push_narrowing_event(NarrowingTarget::OpaqueIndex, from_condition);
     }
 
@@ -537,6 +538,12 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn finish(self) -> (FlowTree, Vec<AnalyzeError>) {
+        let narrowing_capability = FileNarrowingCapability::from_parts(
+            crate::db_index::CompactNameSet::from_iter(self.narrowing_names),
+            crate::db_index::CompactNameSet::from_iter(self.narrowing_index_paths),
+            self.has_opaque_name_target,
+            self.has_opaque_index_target,
+        );
         let flow_tree = FlowTree::new(
             self.decl_bind_expr_ref,
             self.flow_nodes,
@@ -546,7 +553,7 @@ impl<'a> FlowBinder<'a> {
             self.branch_label_info,
             self.condition_label_entries,
             self.assignment_flow_info,
-            self.narrowing_capability,
+            narrowing_capability,
         );
         (flow_tree, self.errors)
     }

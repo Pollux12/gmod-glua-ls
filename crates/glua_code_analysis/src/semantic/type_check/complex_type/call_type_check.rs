@@ -74,7 +74,7 @@ fn get_keyof_keys(context: &TypeCheckContext, prefix_type: &LuaType) -> Vec<LuaT
         .iter()
         .filter_map(|m| match &m.key {
             LuaMemberKey::Integer(i) => Some(LuaType::DocIntegerConst(*i)),
-            LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone().into())),
+            LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone())),
             _ => None,
         })
         .collect::<Vec<_>>();

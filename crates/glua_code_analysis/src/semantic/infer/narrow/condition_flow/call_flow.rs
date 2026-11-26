@@ -187,7 +187,7 @@ fn get_type_at_call_expr_by_function_type(
             let signature_cast = prefix_signature_id.and_then(|signature_id| {
                 db.get_signature_index()
                     .get(&signature_id)
-                    .and_then(|signature| signature.return_cast.as_ref())
+                    .and_then(|signature| signature.return_cast.as_deref())
                     .map(|cast| (cast, signature_id))
             });
             let return_type = f.get_ret();
@@ -240,7 +240,7 @@ fn get_type_at_call_expr_by_function_type(
             };
 
             let ret = signature.get_return_type();
-            let signature_cast = signature.return_cast.as_ref();
+            let signature_cast = signature.return_cast.as_deref();
             let is_valid_guard =
                 call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
             let mut type_guard_did_not_apply = false;
@@ -613,7 +613,7 @@ fn any_member_returns_self_class_name(db: &DbIndex, index_expr: &LuaIndexExpr) -
         return false;
     };
     db.get_member_index()
-        .get_current_members_for_key(&LuaMemberKey::Name(name.text().into()))
+        .get_current_members_for_key(&LuaMemberKey::name(name.text()))
         .into_iter()
         .any(|member| {
             matches!(
@@ -1120,7 +1120,7 @@ fn asserted_type_by_function_type(
     {
         return Some(guard.narrowed_type.clone());
     }
-    let cast = signature.return_cast.as_ref()?;
+    let cast = signature.return_cast.as_deref()?;
     let target = if cast.name == "self" {
         signature_self_target_expr(db, call_expr, id)
     } else {
@@ -1447,8 +1447,8 @@ fn typed_literal_field_has_writes(
         _ => return false,
     };
     let member_key = match index_expr.get_index_key() {
-        Some(LuaIndexKey::Name(name)) => LuaMemberKey::Name(name.get_name_text().into()),
-        Some(LuaIndexKey::String(string)) => LuaMemberKey::Name(string.get_value().into()),
+        Some(LuaIndexKey::Name(name)) => LuaMemberKey::name(name.get_name_text()),
+        Some(LuaIndexKey::String(string)) => LuaMemberKey::name(string.get_value()),
         _ => return false,
     };
     let mut owners = vec![LuaMemberOwner::Element(InFiled::new(
@@ -1569,8 +1569,8 @@ fn table_literal_field_signature_id(
     }
     let (table_file_id, table, _) = receiver_table_literal(db, cache, &receiver)?;
     let member_key = match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
-        LuaIndexKey::String(string) => LuaMemberKey::Name(string.get_value().into()),
+        LuaIndexKey::Name(name) => LuaMemberKey::name(name.get_name_text()),
+        LuaIndexKey::String(string) => LuaMemberKey::name(string.get_value()),
         _ => return None,
     };
     let owner = LuaMemberOwner::Element(InFiled::new(table_file_id, table.get_range()));

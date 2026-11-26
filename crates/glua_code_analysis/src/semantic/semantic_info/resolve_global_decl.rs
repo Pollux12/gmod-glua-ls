@@ -136,7 +136,7 @@ fn resolve_legacy_module_local_decl_id(
 
     // fallback: cross-file member search via GlobalPath member index
     let owner = crate::LuaMemberOwner::GlobalPath(crate::GlobalId::new(&module_env.module_path));
-    let key = crate::LuaMemberKey::Name(name.into());
+    let key = crate::LuaMemberKey::name(name);
     let member_item = db.get_member_index().get_member_item(&owner, &key)?;
     let visible_ids = member_item.visible_member_ids_with_realm_at_offset(db, &file_id, position);
     for member_id in visible_ids {

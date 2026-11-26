@@ -19,6 +19,8 @@ const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[allow(unused)]
 pub async fn run_ls(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + Send>> {
+    #[cfg(feature = "cli")]
+    glua_code_analysis::set_analysis_heap_collector(|| crate::util::collect_thread_heap(true));
     let (connection, threads) = match cmd_args.communication {
         cmd_args::Communication::Stdio => ::lsp_server::Connection::stdio(),
         cmd_args::Communication::Tcp => {

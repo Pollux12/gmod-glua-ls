@@ -376,13 +376,15 @@ impl<K, V> Default for Replaced<K, V> {
 }
 
 /// Drops `garbage` on a thread kept for it, off the path of the barrier
-/// that let go of it.
+/// that let go of it. Bounded so a burst of edits cannot pile up unbounded
+/// replaced shards in memory; overflow drops inline on the caller.
 pub(crate) fn drop_apart<T: Send + 'static>(garbage: T) {
     type Garbage = Box<dyn Send>;
-    static DROPS: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Garbage>>> =
+    const DROP_QUEUE_CAP: usize = 64;
+    static DROPS: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Garbage>>> =
         std::sync::OnceLock::new();
     let drops = DROPS.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Garbage>();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Garbage>(DROP_QUEUE_CAP);
         std::thread::Builder::new()
             .name("index-drops".into())
             .spawn(move || receiver.into_iter().for_each(drop))
@@ -390,7 +392,7 @@ pub(crate) fn drop_apart<T: Send + 'static>(garbage: T) {
             .map(|_| sender)
     });
     if let Some(drops) = drops {
-        let _ = drops.send(Box::new(garbage));
+        let _ = drops.try_send(Box::new(garbage));
     }
 }
 
@@ -1843,7 +1845,7 @@ mod tests {
     }
 
     fn path_key(name: &str) -> LuaMemberKey {
-        LuaMemberKey::Name(name.into())
+        LuaMemberKey::name(name)
     }
 
     fn sorted<K: std::fmt::Debug, V: std::fmt::Debug>(map: &CowShards<K, V>) -> Vec<String> {

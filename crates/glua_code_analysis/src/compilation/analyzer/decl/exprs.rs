@@ -61,7 +61,7 @@ pub fn analyze_index_expr(analyzer: &mut DeclAnalyzer, index_expr: LuaIndexExpr)
     }
     let index_key = index_expr.get_index_key()?;
     let key = match index_key {
-        LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().to_string().into()),
+        LuaIndexKey::Name(name) => LuaMemberKey::name(name.get_name_text().to_string()),
         LuaIndexKey::Integer(int) => {
             if let NumberResult::Int(i) = int.get_number_value() {
                 LuaMemberKey::Integer(i)
@@ -69,7 +69,7 @@ pub fn analyze_index_expr(analyzer: &mut DeclAnalyzer, index_expr: LuaIndexExpr)
                 return None;
             }
         }
-        LuaIndexKey::String(string) => LuaMemberKey::Name(string.get_value().into()),
+        LuaIndexKey::String(string) => LuaMemberKey::name(string.get_value()),
         LuaIndexKey::Expr(_) => return None,
         LuaIndexKey::Idx(i) => LuaMemberKey::Integer(i as i64),
     };
@@ -333,8 +333,8 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
         for field in table_expr.get_fields() {
             if let Some(field_key) = field.get_field_key() {
                 let key: LuaMemberKey = match field_key {
-                    LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
-                    LuaIndexKey::String(str) => LuaMemberKey::Name(str.get_value().into()),
+                    LuaIndexKey::Name(name) => LuaMemberKey::name(name.get_name_text()),
+                    LuaIndexKey::String(str) => LuaMemberKey::name(str.get_value()),
                     LuaIndexKey::Integer(i) => {
                         if let NumberResult::Int(idx) = i.get_number_value() {
                             LuaMemberKey::Integer(idx)

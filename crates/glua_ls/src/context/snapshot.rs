@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
+
+const RENAMED_URI_TTL: Duration = Duration::from_secs(30);
 use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -263,22 +266,41 @@ impl ServerContextSnapshot {
         self.inner.document_version_notify.notify_waiters();
     }
 
+    /// Removes `uri`'s version entry once its `didClose` handler has finished,
+    /// provided no newer open session replaced `session` in the meantime.
+    pub fn forget_closed_document(&self, uri: &Uri, session: u64) {
+        let mut versions = self.document_versions();
+        if matches!(
+            versions.states.get(uri),
+            Some(DocumentVersionState::Closed { session: current }) if *current == session
+        ) {
+            versions.states.remove(uri);
+        }
+    }
+
     /// Remembers the URIs of a rename `didRenameFiles` applied, for the
     /// watcher to recognise its own events for the same rename.
     pub fn note_renamed_uris(&self, uris: impl IntoIterator<Item = Uri>) {
-        self.renamed_uris().extend(uris);
+        let now = Instant::now();
+        let mut renamed = self.renamed_uris();
+        renamed.retain(|_, noted_at| now.saturating_duration_since(*noted_at) < RENAMED_URI_TTL);
+        for uri in uris {
+            renamed.insert(uri, now);
+        }
     }
 
     /// Takes the URIs among `uris` that an applied rename is waiting on.
     pub fn take_renamed_uris<'a>(&self, uris: impl IntoIterator<Item = &'a Uri>) -> HashSet<Uri> {
+        let now = Instant::now();
         let mut renamed = self.renamed_uris();
+        renamed.retain(|_, noted_at| now.saturating_duration_since(*noted_at) < RENAMED_URI_TTL);
         uris.into_iter()
-            .filter_map(|uri| renamed.take(uri))
+            .filter_map(|uri| renamed.remove_entry(uri).map(|(uri, _)| uri))
             .collect()
     }
 
     /// A leaf lock, as [`Self::document_versions`] is.
-    fn renamed_uris(&self) -> MutexGuard<'_, HashSet<Uri>> {
+    fn renamed_uris(&self) -> MutexGuard<'_, HashMap<Uri, Instant>> {
         self.inner
             .renamed_uris
             .lock()
@@ -346,7 +368,7 @@ pub struct ServerContextInner {
     pub document_versions: Arc<Mutex<DocumentVersions>>,
     pub document_version_notify: Arc<Notify>,
     /// Leaf lock: see [`ServerContextSnapshot::renamed_uris`].
-    pub renamed_uris: Mutex<HashSet<Uri>>,
+    pub renamed_uris: Mutex<HashMap<Uri, Instant>>,
 }
 
 #[cfg(test)]
@@ -488,6 +510,33 @@ mod tests {
                 .expect("waiter should join successfully");
             verify_that!(completed, eq(true))?;
             Ok(())
+        })
+    }
+
+    #[gtest]
+    fn forget_closed_document_removes_matching_closed_session_only() -> Result<()> {
+        with_snapshot(|snapshot, uri| {
+            let first = snapshot.note_document_opened(&uri, 1);
+            let closed = snapshot.mark_document_closed(&uri);
+            verify_that!(closed, eq(first))?;
+
+            snapshot.forget_closed_document(&uri, first);
+            verify_that!(
+                snapshot.document_versions().states.contains_key(&uri),
+                eq(false)
+            )?;
+
+            let second = snapshot.note_document_opened(&uri, 1);
+            snapshot.forget_closed_document(&uri, first);
+            verify_that!(
+                snapshot.is_current_document_update(&uri, second, 1),
+                eq(true)
+            )?;
+
+            let reopened = snapshot.note_document_opened(&uri, 1);
+            let _ = snapshot.mark_document_closed(&uri);
+            snapshot.forget_closed_document(&uri, second);
+            verify_that!(snapshot.is_document_closed_for(&uri, reopened), eq(true))
         })
     }
 }

@@ -846,7 +846,7 @@ fn type_has_non_nullable_member(
                 }
                 let visible_item = match visible.as_slice() {
                     [member_id] => crate::LuaMemberIndexItem::One(*member_id),
-                    _ => crate::LuaMemberIndexItem::Many(visible),
+                    _ => crate::LuaMemberIndexItem::Many(visible.into_boxed_slice()),
                 };
                 // Fail closed: if the winning member's type cannot be
                 // resolved, do not fall back to a parent.
@@ -909,8 +909,8 @@ fn member_owner_for_type(typ: LuaType) -> Option<LuaMemberOwner> {
 
 fn literal_member_key(index_expr: &LuaIndexExpr) -> Option<LuaMemberKey> {
     match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
-        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::name(name.get_name_text())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::name(string.get_value())),
         _ => None,
     }
 }
@@ -4357,7 +4357,7 @@ fn global_path_definitions(
         .get_member_index()
         .get_member_item(
             &LuaMemberOwner::GlobalPath(crate::GlobalId::new(owner)),
-            &LuaMemberKey::Name(key.into()),
+            &LuaMemberKey::name(key),
         )
         .map(|item| item.get_member_ids())
         .unwrap_or_default()

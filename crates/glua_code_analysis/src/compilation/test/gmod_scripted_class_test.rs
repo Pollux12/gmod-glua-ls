@@ -3185,7 +3185,7 @@ end
             .get_member_index()
             .get_member_item(
                 &LuaMemberOwner::Type(LuaTypeDeclId::global("AnchorPanel")),
-                &LuaMemberKey::Name("BaseClass".into()),
+                &LuaMemberKey::name("BaseClass"),
             )
             .expect("expected synthesized BaseClass member");
 
@@ -3242,7 +3242,7 @@ end
 
         let paint_member = db.get_member_index().get_member_item(
             &LuaMemberOwner::Type(LuaTypeDeclId::global("AnnotatedPanel")),
-            &LuaMemberKey::Name("Paint".into()),
+            &LuaMemberKey::name("Paint"),
         );
         assert!(
             paint_member.is_some(),
@@ -3301,7 +3301,7 @@ end
 
         let paint_member = db.get_member_index().get_member_item(
             &LuaMemberOwner::Type(LuaTypeDeclId::global("CrossFilePanel")),
-            &LuaMemberKey::Name("Paint".into()),
+            &LuaMemberKey::name("Paint"),
         );
         assert!(
             paint_member.is_some(),
@@ -3355,7 +3355,7 @@ end
 
         let paint_member = db.get_member_index().get_member_item(
             &LuaMemberOwner::Type(LuaTypeDeclId::global("ColonPanel")),
-            &LuaMemberKey::Name("Paint".into()),
+            &LuaMemberKey::name("Paint"),
         );
         assert!(
             paint_member.is_some(),
@@ -3509,10 +3509,10 @@ end
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("annotated_network"));
         let getter = db
             .get_member_index()
-            .get_member_item(&owner, &LuaMemberKey::Name("GetEnabled".into()));
+            .get_member_item(&owner, &LuaMemberKey::name("GetEnabled"));
         let setter = db
             .get_member_index()
-            .get_member_item(&owner, &LuaMemberKey::Name("SetEnabled".into()));
+            .get_member_item(&owner, &LuaMemberKey::name("SetEnabled"));
 
         assert!(getter.is_some(), "expected annotated wrapper getter");
         assert!(setter.is_some(), "expected annotated wrapper setter");
@@ -3559,7 +3559,7 @@ end
         for name in ["GetActive", "SetActive", "GetSpeed", "SetSpeed"] {
             let member = db
                 .get_member_index()
-                .get_member_item(&owner, &LuaMemberKey::Name(name.into()));
+                .get_member_item(&owner, &LuaMemberKey::name(name));
             assert!(
                 member.is_some(),
                 "expected annotated NetworkVar overload to synthesize {name}"
@@ -4556,7 +4556,7 @@ end
             let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&class_name));
             let member_files: Vec<crate::FileId> = db
                 .get_member_index()
-                .get_member_item(&owner, &LuaMemberKey::Name("BaseClass".into()))
+                .get_member_item(&owner, &LuaMemberKey::name("BaseClass"))
                 .map(|item| {
                     item.get_member_ids()
                         .iter()
@@ -12469,7 +12469,7 @@ end
 
         let shared_uri = ws.virtual_url_generator.new_uri(shared_path);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_mad_deagle"));
-        let key = LuaMemberKey::Name("WepSelectIcon".into());
+        let key = LuaMemberKey::name("WepSelectIcon");
 
         let member_item_before = ws
             .analysis
@@ -12660,7 +12660,7 @@ end
         );
 
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
-        let key = LuaMemberKey::Name("TestValue".into());
+        let key = LuaMemberKey::name("TestValue");
         assert!(
             ws.get_db_mut()
                 .get_member_index()
@@ -12724,7 +12724,7 @@ GM.TestValue = 1"#,
         );
 
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
-        let key = LuaMemberKey::Name("TestValue".into());
+        let key = LuaMemberKey::name("TestValue");
         assert!(
             ws.get_db_mut()
                 .get_member_index()
@@ -12773,7 +12773,7 @@ GM.TestValue = 1"#,
         );
 
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
-        let key = LuaMemberKey::Name("TestValue".into());
+        let key = LuaMemberKey::name("TestValue");
         assert!(
             ws.get_db_mut()
                 .get_member_index()
@@ -12864,7 +12864,7 @@ GM.TestValue = 1"#,
         let derived_id = LuaTypeDeclId::global("gamemode_darkrp");
         let db = ws.get_db_mut();
         let owner = LuaMemberOwner::Type(derived_id);
-        let key = LuaMemberKey::Name("Sandbox".into());
+        let key = LuaMemberKey::name("Sandbox");
         let member_item = db
             .get_member_index()
             .get_member_item(&owner, &key)
@@ -13011,7 +13011,7 @@ GM.TestValue = 1"#,
 
         let db = ws.get_db_mut();
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
-        let key = LuaMemberKey::Name("Sandbox".into());
+        let key = LuaMemberKey::name("Sandbox");
         let member_item = db
             .get_member_index()
             .get_member_item(&owner, &key)
@@ -13090,7 +13090,7 @@ GM.TestValue = 1"#,
 
         let db = ws.get_db_mut();
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
-        let key = LuaMemberKey::Name("Sandbox".into());
+        let key = LuaMemberKey::name("Sandbox");
         let member_item = db.get_member_index().get_member_item(&owner, &key).unwrap();
         let count = match member_item {
             crate::LuaMemberIndexItem::One(_) => 1,
@@ -13129,7 +13129,7 @@ GM.TestValue = 1"#,
         let member_item = ws
             .get_db_mut()
             .get_member_index()
-            .get_member_item(&owner, &LuaMemberKey::Name("Sandbox".into()));
+            .get_member_item(&owner, &LuaMemberKey::name("Sandbox"));
 
         assert!(
             member_item.is_some(),
@@ -13189,7 +13189,7 @@ GM.TestValue = 1"#,
 
         let db = ws.get_db_mut();
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_darkrp"));
-        let key = LuaMemberKey::Name("Sandbox".into());
+        let key = LuaMemberKey::name("Sandbox");
         assert!(
             db.get_member_index()
                 .get_member_item(&owner, &key)
@@ -13359,7 +13359,7 @@ GM.TestValue = 1"#,
         let member_item = ws
             .get_db_mut()
             .get_member_index()
-            .get_member_item(&owner, &LuaMemberKey::Name("Other".into()))
+            .get_member_item(&owner, &LuaMemberKey::name("Other"))
             .expect("expected Other alias");
         let count = match member_item {
             crate::LuaMemberIndexItem::One(_) => 1,

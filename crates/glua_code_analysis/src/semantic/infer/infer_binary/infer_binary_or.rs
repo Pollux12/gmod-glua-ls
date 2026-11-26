@@ -413,10 +413,14 @@ fn is_initializer_member_cycle(
         super::super::infer_index::global_expr_access_path(db, file_id, &prefix)
     {
         let path = super::super::infer_index::global_expr_access_path(db, file_id, &operand)?;
-        LuaMemberIndexItem::Many(members.get_member_history_for_global_path(
-            &LuaMemberOwner::GlobalPath(GlobalId::new(&owner_path)),
-            &GlobalId::new(&path),
-        ))
+        LuaMemberIndexItem::Many(
+            members
+                .get_member_history_for_global_path(
+                    &LuaMemberOwner::GlobalPath(GlobalId::new(&owner_path)),
+                    &GlobalId::new(&path),
+                )
+                .into_boxed_slice(),
+        )
     } else {
         let owner = match crate::infer_expr(db, cache, prefix).ok()? {
             LuaType::TableConst(site) => LuaMemberOwner::Element(site),

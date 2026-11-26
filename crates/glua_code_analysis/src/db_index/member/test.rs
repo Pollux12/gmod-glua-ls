@@ -15,7 +15,7 @@ mod tests {
         key: &str,
         feature: LuaMemberFeature,
     ) -> LuaMember {
-        LuaMember::new(member_id, LuaMemberKey::Name(key.into()), feature, None)
+        LuaMember::new(member_id, LuaMemberKey::name(key), feature, None)
     }
 
     fn make_member_id(file_id: FileId, start: u32) -> LuaMemberId {
@@ -289,8 +289,8 @@ mod tests {
             batched.member_owner_key_index
         );
         assert_eq!(
-            sequential.member_owner_key_history_index,
-            batched.member_owner_key_history_index
+            sequential.member_owner_key_displaced,
+            batched.member_owner_key_displaced
         );
     }
 
@@ -323,7 +323,7 @@ mod tests {
         let file_id = FileId::new(1);
         let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
         let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let member_id = make_member_id(file_id, 1);
 
         let mut index = LuaMemberIndex::new();
@@ -358,7 +358,7 @@ mod tests {
         let file_id = FileId::new(2);
         let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OriginalOwner"));
         let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReassignedOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = make_member_id(file_id, 1);
         let second_member_id = make_member_id(file_id, 3);
 
@@ -446,7 +446,7 @@ mod tests {
         let file_id = FileId::new(6);
         let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
         let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let member_id = make_member_id(file_id, 1);
         let mut index = LuaMemberIndex::new();
 
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn get_members_cache_invalidates_when_one_promotes_to_many_after_warm() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = make_member_id(FileId::new(4), 20);
         let second_member_id = make_member_id(FileId::new(4), 10);
         let mut index = LuaMemberIndex::new();
@@ -510,7 +510,7 @@ mod tests {
         assert!(index.get_member_owner(&member_id).is_some());
         assert!(
             !index
-                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
+                .get_current_members_for_key(&LuaMemberKey::name("field"))
                 .is_empty()
         );
 
@@ -519,7 +519,7 @@ mod tests {
         assert!(index.get_member_owner(&member_id).is_none());
         assert!(
             index
-                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
+                .get_current_members_for_key(&LuaMemberKey::name("field"))
                 .is_empty()
         );
     }
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn key_lookup_cache_invalidates_after_member_mutation() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = make_member_id(FileId::new(9), 1);
         let second_member_id = make_member_id(FileId::new(10), 3);
         let mut index = LuaMemberIndex::new();
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn a_declaration_and_a_write_coexist_whichever_reaches_the_slot_first() {
         let owner = path("holdem");
-        let key = LuaMemberKey::Name("action".into());
+        let key = LuaMemberKey::name("action");
         // `function holdem.action(...)` in the server file.
         let declared = make_index_member_id(FileId::new(6), 30);
         // `holdem.action = { ... }` in the client file.
@@ -583,7 +583,7 @@ mod tests {
             index.get_member_item(&owner, &key).cloned()
         };
 
-        let both = Some(LuaMemberIndexItem::Many(vec![written, declared]));
+        let both = Some(LuaMemberIndexItem::Many(Box::new([written, declared])));
         assert_eq!(
             item_for(
                 (written, LuaMemberFeature::FileDefine),
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn visible_owner_key_other_member_check_uses_current_visible_members() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = make_index_member_id(FileId::new(4), 1);
         let second_member_id = make_index_member_id(FileId::new(4), 3);
 
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn meta_only_member_item_preserves_meta_when_assignment_is_added() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let meta_member_id = make_member_id(FileId::new(4), 1);
         let assignment_member_id = make_index_member_id(FileId::new(4), 3);
 
@@ -652,17 +652,17 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 meta_member_id,
                 assignment_member_id,
-            ]))
+            ])))
         );
     }
 
     #[test]
     fn preserved_assignment_duplicate_insertions_keep_existing_item_order() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = make_index_member_id(FileId::new(4), 1);
         let second_member_id = make_index_member_id(FileId::new(4), 3);
 
@@ -680,10 +680,10 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 first_member_id,
                 second_member_id,
-            ]))
+            ])))
         );
     }
 
@@ -691,7 +691,7 @@ mod tests {
     fn alias_adds_to_an_existing_file_define_without_displacing_it() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
         let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let own_member_id = make_index_member_id(FileId::new(1), 10);
         let aliased_member_id = make_index_member_id(FileId::new(2), 20);
 
@@ -709,10 +709,10 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 own_member_id,
                 aliased_member_id,
-            ])),
+            ]))),
             "an alias only ever adds; it must never replace the owner's own writer"
         );
     }
@@ -721,7 +721,7 @@ mod tests {
     fn a_table_field_write_arriving_after_an_alias_still_takes_the_slot() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
         let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         // A table-literal field is a `FileDefine` that is not an index-expr
         // assignment, so it falls through to the latest-defined rule.
         let own_member_id = make_member_id(FileId::new(1), 10);
@@ -740,10 +740,10 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 own_member_id,
                 aliased_member_id,
-            ])),
+            ]))),
             "which of the two arrived first must not decide the slot"
         );
     }
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn marked_non_overwriting_file_defines_share_lookup_item() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let first_member_id = LuaMemberId::new(
             LuaSyntaxId::new(
                 LuaSyntaxKind::IndexExpr.into(),
@@ -791,17 +791,17 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 first_member_id,
                 second_member_id
-            ]))
+            ])))
         );
     }
 
     #[test]
     fn preserved_assignment_insertion_invalidates_get_members_cache_after_warm() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let later_member_id = make_index_member_id(FileId::new(4), 30);
         let earlier_member_id = make_index_member_id(FileId::new(4), 10);
         let mut index = LuaMemberIndex::new();
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn many_marked_non_overwriting_file_defines_share_lookup_item() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let mut index = LuaMemberIndex::new();
 
         for i in 0..128 {
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn marked_non_overwriting_file_defines_keep_stable_order_when_added_out_of_order() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let mut index = LuaMemberIndex::new();
 
         for start in [30, 10, 20] {
@@ -883,11 +883,11 @@ mod tests {
 
         assert_eq!(
             index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
+            Some(&LuaMemberIndexItem::Many(Box::new([
                 make_index_member_id(FileId::new(4), 10),
                 make_index_member_id(FileId::new(4), 20),
                 make_index_member_id(FileId::new(4), 30),
-            ]))
+            ])))
         );
     }
 
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn cross_file_all_bootstrap_writers_still_merge() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("stock".into());
+        let key = LuaMemberKey::name("stock");
         let first_id = make_index_member_id(FileId::new(1), 10);
         let second_id = make_index_member_id(FileId::new(2), 20);
 
@@ -918,8 +918,8 @@ mod tests {
         let file_id = FileId::new(6);
         let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
         let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let old_key = LuaMemberKey::Name("old_field".into());
-        let new_key = LuaMemberKey::Name("new_field".into());
+        let old_key = LuaMemberKey::name("old_field");
+        let new_key = LuaMemberKey::name("new_field");
         let member_id = make_member_id(file_id, 10);
         let mut index = LuaMemberIndex::new();
 
@@ -1042,7 +1042,7 @@ mod tests {
         assert_ne!(fingerprint(&index, &member), member_seen);
         assert_eq!(fingerprint(&index, read), read_seen);
 
-        index.rekey_member(member_id, LuaMemberKey::Name("y".into()));
+        index.rekey_member(member_id, LuaMemberKey::name("y"));
         assert_ne!(fingerprint(&index, read), read_seen);
     }
 
@@ -1092,7 +1092,7 @@ mod tests {
             owner.clone(),
             LuaMember::new(
                 member_id,
-                LuaMemberKey::Name("net.handler".into()),
+                LuaMemberKey::name("net.handler"),
                 LuaMemberFeature::FileFieldDecl,
                 Some(global_id.clone()),
             ),
@@ -1115,7 +1115,7 @@ mod tests {
             owner.clone(),
             LuaMember::new(
                 member_id,
-                LuaMemberKey::Name("handler".into()),
+                LuaMemberKey::name("handler"),
                 LuaMemberFeature::FileFieldDecl,
                 Some(global_id.clone()),
             ),
@@ -1149,8 +1149,8 @@ mod tests {
     fn rekey_member_moves_the_member_between_slots() {
         let file = FileId::new(1);
         let owner = LuaMemberOwner::Element(site(1, 10, 12));
-        let old_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
-        let new_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let old_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::Integer));
+        let new_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
         let mover = make_index_member_id(file, 20);
         let stayer = make_index_member_id(file, 30);
 
@@ -1201,8 +1201,8 @@ mod tests {
     fn removing_a_rekeyed_members_file_leaves_no_residue() {
         let file = FileId::new(1);
         let owner = LuaMemberOwner::Element(site(1, 10, 12));
-        let old_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
-        let new_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let old_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::Integer));
+        let new_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
         let member_id = make_index_member_id(file, 20);
 
         let mut index = LuaMemberIndex::new();
@@ -1220,7 +1220,7 @@ mod tests {
             assert!(!index.current_members_by_key.contains_key(key));
         }
         assert!(!index.member_owner_key_index.contains_key(&owner));
-        assert!(!index.member_owner_key_history_index.contains_key(&owner));
+        assert!(!index.member_owner_key_displaced.contains_key(&owner));
         assert!(!index.member_current_owner.contains_key(&member_id));
     }
 
@@ -1270,11 +1270,7 @@ mod tests {
 
     /// How many ids `owner`'s history slot for `key` holds, homed or not.
     fn history_len(index: &LuaMemberIndex, owner: &LuaMemberOwner, key: &LuaMemberKey) -> usize {
-        index
-            .member_owner_key_history_index
-            .get(owner)
-            .and_then(|items| items.get(key))
-            .map_or(0, |ids| ids.len())
+        index.history_slot_ids(owner, key).len()
     }
 
     #[test]
@@ -1282,7 +1278,7 @@ mod tests {
         let file_id = FileId::new(1);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReturnOwner"));
         let away = LuaMemberOwner::Type(LuaTypeDeclId::global("AwayOwner"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let member_id = make_member_id(file_id, 1);
 
         let mut index = LuaMemberIndex::new();
@@ -1318,8 +1314,8 @@ mod tests {
     fn refiling_under_a_former_key_does_not_duplicate_history() {
         let file_id = FileId::new(1);
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("KeyOwner"));
-        let first_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
-        let second_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let first_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::Integer));
+        let second_key = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
         let member_id = make_index_member_id(file_id, 1);
 
         let mut index = LuaMemberIndex::new();
@@ -1377,16 +1373,21 @@ mod tests {
                 members.fingerprint()
             )
         }));
-        state.extend(
-            index
-                .member_owner_key_history_index
-                .iter()
-                .flat_map(|(owner, slots)| {
-                    slots
-                        .iter()
-                        .map(move |(key, ids)| format!("slot {owner:?} {key:?} {ids:?}"))
-                }),
-        );
+        let mut owners_keys = HashSet::default();
+        for map in [
+            &index.member_owner_key_index,
+            &index.member_owner_key_displaced,
+        ] {
+            for (owner, slots) in map {
+                for key in slots.keys() {
+                    owners_keys.insert((owner.clone(), key.clone()));
+                }
+            }
+        }
+        state.extend(owners_keys.into_iter().map(|(owner, key)| {
+            let ids = index.history_slot_ids(&owner, &key);
+            format!("slot {owner:?} {key:?} {ids:?}")
+        }));
         state.sort();
         state
     }
@@ -1395,8 +1396,8 @@ mod tests {
     fn forks_rekeying_different_members_alike_install_the_history_a_recount_gives() {
         use crate::db_index::cow_shards::TaskFork;
         let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("ix.gui"));
-        let unknown = LuaMemberKey::ExprType(crate::LuaType::Unknown);
-        let string = LuaMemberKey::ExprType(crate::LuaType::String);
+        let unknown = LuaMemberKey::ExprType(Box::new(crate::LuaType::Unknown));
+        let string = LuaMemberKey::ExprType(Box::new(crate::LuaType::String));
         let movers = [
             make_index_member_id(FileId::new(330), 4446),
             make_index_member_id(FileId::new(387), 1174),
@@ -1545,7 +1546,7 @@ mod tests {
     #[test]
     fn removing_a_co_writer_leaves_the_slot_as_a_build_of_the_rest_files_it() {
         let kept = make_member_id(FileId::new(1), 10);
-        let key = LuaMemberKey::Name("x".into());
+        let key = LuaMemberKey::name("x");
         let mut cold = LuaMemberIndex::new();
         cold.add_member(path("Holder"), make_member(kept, "x"));
         for removed_start in [5, 20] {
@@ -1566,7 +1567,7 @@ mod tests {
     #[test]
     fn refiling_a_member_under_another_owner_and_key_leaves_nothing_current_behind() {
         let id = make_member_id(FileId::new(1), 10);
-        let old_key = LuaMemberKey::Name("old".into());
+        let old_key = LuaMemberKey::name("old");
         let mut index = LuaMemberIndex::new();
         index.add_member(path("A"), make_member(id, "old"));
 
@@ -1589,7 +1590,7 @@ mod tests {
     fn a_member_forgotten_with_its_literal_is_unlisted_from_its_aliases() {
         let literal = site(1, 10, 30);
         let alias = LuaMemberOwner::Type(LuaTypeDeclId::global("Alias"));
-        let key = LuaMemberKey::Name("field".into());
+        let key = LuaMemberKey::name("field");
         let own = make_index_member_id(FileId::new(3), 5);
         let homed = make_index_member_id(FileId::new(2), 20);
         let mut index = LuaMemberIndex::new();
@@ -1619,7 +1620,7 @@ mod tests {
         index.remove(FileId::new(2));
 
         assert_eq!(
-            index.get_member_item(&away, &LuaMemberKey::Name("field".into())),
+            index.get_member_item(&away, &LuaMemberKey::name("field")),
             None
         );
     }

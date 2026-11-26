@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use glua_parser::{LuaVersionCondition, VisibilityKind};
 
@@ -10,20 +14,60 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LuaCommonProperty {
     pub visibility: VisibilityKind,
     /// Whether a tag stated `visibility`, rather than it being the default.
     visibility_stated: bool,
-    pub description: Option<Box<String>>,
-    pub default_value: Option<LuaDocDefaultValue>,
-    pub source: Option<Box<String>>,
-    pub deprecated: Option<Box<LuaDeprecated>>,
-    pub version_conds: Option<Box<Vec<LuaVersionCondition>>>,
-    pub tag_content: Option<Box<LuaTagContent>>,
-    pub export: Option<LuaExport>,
     pub decl_features: DeclFeatureFlag,
-    pub attribute_uses: Option<Arc<Vec<LuaAttributeUse>>>,
+
+    extras: Option<Box<PropertyExtras>>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct PropertyExtras {
+    description: Option<Box<String>>,
+    default_value: Option<LuaDocDefaultValue>,
+    source: Option<Box<String>>,
+    deprecated: Option<Box<LuaDeprecated>>,
+    version_conds: Option<Box<Vec<LuaVersionCondition>>>,
+    tag_content: Option<Box<LuaTagContent>>,
+    export: Option<LuaExport>,
+    attribute_uses: Option<Arc<Vec<LuaAttributeUse>>>,
+}
+
+impl fmt::Debug for LuaCommonProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LuaCommonProperty")
+            .field("visibility", &self.visibility)
+            .field("visibility_stated", &self.visibility_stated)
+            .field("description", &self.description())
+            .field("default_value", &self.default_value())
+            .field("source", &self.source())
+            .field("deprecated", &self.deprecated())
+            .field("version_conds", &self.version_conds())
+            .field("tag_content", &self.tag_content())
+            .field("export", &self.export())
+            .field("decl_features", &self.decl_features)
+            .field("attribute_uses", &self.attribute_uses())
+            .finish()
+    }
+}
+
+impl Hash for LuaCommonProperty {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.visibility.hash(state);
+        self.visibility_stated.hash(state);
+        self.description().hash(state);
+        self.default_value().hash(state);
+        self.source().hash(state);
+        self.deprecated().hash(state);
+        self.version_conds().hash(state);
+        self.tag_content().hash(state);
+        self.export().hash(state);
+        self.decl_features.hash(state);
+        self.attribute_uses().hash(state);
+    }
 }
 
 impl Default for LuaCommonProperty {
@@ -37,44 +81,41 @@ impl LuaCommonProperty {
         Self {
             visibility: VisibilityKind::Public,
             visibility_stated: false,
-            description: None,
-            default_value: None,
-            source: None,
-            deprecated: None,
-            version_conds: None,
-            tag_content: None,
-            export: None,
             decl_features: DeclFeatureFlag::new(),
-            attribute_uses: None,
+            extras: None,
         }
     }
 
+    fn extras_mut(&mut self) -> &mut PropertyExtras {
+        self.extras.get_or_insert_default()
+    }
+
     pub fn description(&self) -> Option<&String> {
-        self.description.as_deref()
+        self.extras.as_deref()?.description.as_deref()
     }
 
     pub fn version_conds(&self) -> Option<&Vec<LuaVersionCondition>> {
-        self.version_conds.as_deref()
+        self.extras.as_deref()?.version_conds.as_deref()
     }
 
     pub fn export(&self) -> Option<&LuaExport> {
-        self.export.as_ref()
+        self.extras.as_deref()?.export.as_ref()
     }
 
     pub fn tag_content(&self) -> Option<&LuaTagContent> {
-        self.tag_content.as_deref()
+        self.extras.as_deref()?.tag_content.as_deref()
     }
 
     pub fn deprecated(&self) -> Option<&LuaDeprecated> {
-        self.deprecated.as_deref()
+        self.extras.as_deref()?.deprecated.as_deref()
     }
 
     pub fn source(&self) -> Option<&String> {
-        self.source.as_deref()
+        self.extras.as_deref()?.source.as_deref()
     }
 
     pub fn default_value(&self) -> Option<&LuaDocDefaultValue> {
-        self.default_value.as_ref()
+        self.extras.as_deref()?.default_value.as_ref()
     }
 
     pub fn set_visibility(&mut self, visibility: VisibilityKind) {
@@ -83,36 +124,37 @@ impl LuaCommonProperty {
     }
 
     pub fn add_extra_description(&mut self, description: String) {
-        self.description = Some(Box::new(description));
+        self.extras_mut().description = Some(Box::new(description));
     }
 
     pub fn add_extra_source(&mut self, source: String) {
-        self.source = Some(Box::new(source));
+        self.extras_mut().source = Some(Box::new(source));
     }
 
     pub fn add_extra_default_value(&mut self, default_value: LuaDocDefaultValue) {
-        self.default_value = Some(default_value);
+        self.extras_mut().default_value = Some(default_value);
     }
 
     pub fn add_extra_deprecated(&mut self, message: Option<String>) {
-        self.deprecated = match message {
+        self.extras_mut().deprecated = match message {
             Some(msg) => Some(Box::new(LuaDeprecated::DeprecatedWithMessage(msg))),
             None => Some(Box::new(LuaDeprecated::Deprecated)),
         };
     }
 
     pub fn add_extra_version_cond(&mut self, conds: Vec<LuaVersionCondition>) {
-        self.version_conds = Some(Box::new(conds));
+        self.extras_mut().version_conds = Some(Box::new(conds));
     }
 
     pub fn add_extra_tag(&mut self, tag: String, content: String) {
-        self.tag_content
+        self.extras_mut()
+            .tag_content
             .get_or_insert_with(|| Box::new(LuaTagContent::new()))
             .add_tag(tag, content);
     }
 
     pub fn add_extra_export(&mut self, export: LuaExport) {
-        self.export = Some(export);
+        self.extras_mut().export = Some(export);
     }
 
     pub fn add_decl_feature(&mut self, feature: PropertyDeclFeature) {
@@ -121,14 +163,15 @@ impl LuaCommonProperty {
 
     pub fn add_attribute_use(&mut self, attribute_use: LuaAttributeUse) {
         Arc::make_mut(
-            self.attribute_uses
+            self.extras_mut()
+                .attribute_uses
                 .get_or_insert_with(|| Arc::new(Vec::new())),
         )
         .push(attribute_use);
     }
 
     pub fn attribute_uses(&self) -> Option<&Arc<Vec<LuaAttributeUse>>> {
-        self.attribute_uses.as_ref()
+        self.extras.as_deref()?.attribute_uses.as_ref()
     }
 
     /// Folds a later contributor's documentation into an earlier one's. Scalar fields keep the
@@ -138,39 +181,45 @@ impl LuaCommonProperty {
             self.visibility = other.visibility;
             self.visibility_stated = other.visibility_stated;
         }
+        self.decl_features = self.decl_features.union(other.decl_features);
+
+        let Some(other_extras) = other.extras.as_deref() else {
+            return;
+        };
+        let mut new_extras = PropertyExtras::default();
+        let extras = self.extras.as_deref_mut().unwrap_or(&mut new_extras);
         // A bare `---@class Foo` records an empty description, which must not mask the docs
         // another file wrote for the same class.
-        if self
+        if extras
             .description
             .as_deref()
             .is_none_or(|text| text.is_empty())
-            && other
+            && other_extras
                 .description
                 .as_deref()
                 .is_some_and(|text| !text.is_empty())
         {
-            self.description.clone_from(&other.description);
+            extras.description.clone_from(&other_extras.description);
         }
-        if self.default_value.is_none() {
-            self.default_value.clone_from(&other.default_value);
+        if extras.default_value.is_none() {
+            extras.default_value.clone_from(&other_extras.default_value);
         }
-        if self.source.is_none() {
-            self.source.clone_from(&other.source);
+        if extras.source.is_none() {
+            extras.source.clone_from(&other_extras.source);
         }
-        if self.deprecated.is_none() {
-            self.deprecated.clone_from(&other.deprecated);
+        if extras.deprecated.is_none() {
+            extras.deprecated.clone_from(&other_extras.deprecated);
         }
-        if self.version_conds.is_none() {
-            self.version_conds.clone_from(&other.version_conds);
+        if extras.version_conds.is_none() {
+            extras.version_conds.clone_from(&other_extras.version_conds);
         }
-        if self.export.is_none() {
-            self.export.clone_from(&other.export);
+        if extras.export.is_none() {
+            extras.export.clone_from(&other_extras.export);
         }
-        self.decl_features = self.decl_features.union(other.decl_features);
 
-        if let Some(tags) = other.tag_content() {
+        if let Some(tags) = &other_extras.tag_content {
             for (tag, content) in tags.get_all_tags() {
-                let merged = self
+                let merged = extras
                     .tag_content
                     .get_or_insert_with(|| Box::new(LuaTagContent::new()));
                 if !merged
@@ -183,10 +232,11 @@ impl LuaCommonProperty {
             }
         }
 
-        if let Some(uses) = other.attribute_uses() {
+        if let Some(uses) = &other_extras.attribute_uses {
             for attribute_use in uses.iter() {
                 let merged = Arc::make_mut(
-                    self.attribute_uses
+                    extras
+                        .attribute_uses
                         .get_or_insert_with(|| Arc::new(Vec::new())),
                 );
                 if !merged.contains(attribute_use) {
@@ -194,10 +244,13 @@ impl LuaCommonProperty {
                 }
             }
         }
+        if new_extras != PropertyExtras::default() {
+            self.extras = Some(Box::new(new_extras));
+        }
     }
 
     pub fn find_attribute_use(&self, id: &str) -> Option<&LuaAttributeUse> {
-        self.attribute_uses.as_ref().and_then(|attribute_uses| {
+        self.attribute_uses().and_then(|attribute_uses| {
             attribute_uses
                 .iter()
                 .find(|attribute_use| attribute_use.id.get_name() == id)

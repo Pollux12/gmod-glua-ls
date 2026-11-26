@@ -116,7 +116,7 @@ fn build_subtype_member_hover(
     else {
         return None;
     };
-    let key = LuaMemberKey::Name(token.text().into());
+    let key = LuaMemberKey::name(token.text());
     let members = semantic_model.get_subtype_members_for_key(&type_id, &key);
     let (_, member_id) = members.first()?;
     let mut hover_builder = build_hover_content(
@@ -319,7 +319,7 @@ fn is_dynamic_field_for_type(
         return false;
     }
 
-    let key = LuaMemberKey::Name(field_name.into());
+    let key = LuaMemberKey::name(field_name);
     semantic_model
         .get_member_info_with_key_at_offset(typ, key, true, position_offset)
         .is_some_and(|members| {

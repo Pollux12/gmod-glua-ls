@@ -451,9 +451,9 @@ impl LuaTypeDecl {
             for enum_member in enum_members {
                 let member_key = enum_member.get_key();
                 let fake_type = match member_key {
-                    LuaMemberKey::Name(name) => LuaType::DocStringConst(name.clone().into()),
+                    LuaMemberKey::Name(name) => LuaType::DocStringConst(name.clone()),
                     LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::ExprType(typ) => typ.as_ref().clone(),
                     LuaMemberKey::None => continue,
                 };
 
@@ -551,6 +551,23 @@ mod decl_id_intern {
             id
         })
     }
+
+    pub fn clear() {
+        GLOBAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.clear();
+            cache.shrink_to_fit();
+        });
+        LOCAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.clear();
+            cache.shrink_to_fit();
+        });
+    }
+}
+
+pub(crate) fn clear_type_decl_id_intern_cache() {
+    decl_id_intern::clear();
 }
 
 impl LuaTypeDeclId {

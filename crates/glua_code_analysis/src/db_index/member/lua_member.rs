@@ -1,6 +1,7 @@
-use std::ops::Deref;
+use std::hash::{Hash, Hasher};
 
 use glua_parser::{LuaIndexKey, LuaSyntaxId, LuaSyntaxKind, NumberResult};
+use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -15,6 +16,8 @@ pub struct LuaMember {
     feature: LuaMemberFeature,
     global_id: Option<GlobalId>,
 }
+
+const _: () = assert!(std::mem::size_of::<LuaMember>() == 48);
 
 impl LuaMember {
     pub fn new(
@@ -119,23 +122,41 @@ impl LuaMemberId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LuaMemberKey {
     None,
     Integer(i64),
-    Name(SmolStr),
-    ExprType(LuaType),
+    Name(ArcIntern<SmolStr>),
+    ExprType(Box<LuaType>),
+}
+
+const _: () = assert!(std::mem::size_of::<LuaMemberKey>() == 16);
+
+impl Hash for LuaMemberKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::None => {}
+            Self::Integer(value) => value.hash(state),
+            Self::Name(name) => name.as_ref().hash(state),
+            Self::ExprType(typ) => typ.hash(state),
+        }
+    }
 }
 
 impl LuaMemberKey {
+    pub fn name(name: impl Into<SmolStr>) -> Self {
+        Self::Name(ArcIntern::new(name.into()))
+    }
+
     pub fn from_index_key(
         db: &DbIndex,
         cache: &mut LuaInferCache,
         key: &LuaIndexKey,
     ) -> Result<Self, InferFailReason> {
         match key {
-            LuaIndexKey::Name(name) => Ok(LuaMemberKey::Name(name.get_name_text().into())),
-            LuaIndexKey::String(str) => Ok(LuaMemberKey::Name(str.get_value().into())),
+            LuaIndexKey::Name(name) => Ok(LuaMemberKey::name(name.get_name_text())),
+            LuaIndexKey::String(str) => Ok(LuaMemberKey::name(str.get_value())),
             LuaIndexKey::Integer(i) => {
                 if let NumberResult::Int(idx) = i.get_number_value() {
                     Ok(LuaMemberKey::Integer(idx))
@@ -160,7 +181,7 @@ impl LuaMemberKey {
             LuaIndexKey::Expr(expr) => match infer_expr(db, cache, expr.clone()) {
                 Ok(expr_type) => Ok(Self::from_expr_type(expr_type)),
                 Err(reason) if reason.is_need_resolve() => {
-                    Ok(LuaMemberKey::ExprType(LuaType::Unknown))
+                    Ok(LuaMemberKey::ExprType(Box::new(LuaType::Unknown)))
                 }
                 Err(reason) => Err(reason),
             },
@@ -170,8 +191,7 @@ impl LuaMemberKey {
 
     pub(crate) fn from_expr_type(expr_type: LuaType) -> Self {
         match expr_type {
-            LuaType::StringConst(s) => LuaMemberKey::Name(s.deref().clone()),
-            LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),
+            LuaType::StringConst(s) | LuaType::DocStringConst(s) => LuaMemberKey::Name(s),
             LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
             LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(i),
             _ => {
@@ -183,9 +203,9 @@ impl LuaMemberKey {
                 // answer depend on how resolved the key expression was when
                 // the write was indexed.
                 if expr_type.contain_tpl() || !crate::db_index::is_informative_type(&expr_type) {
-                    LuaMemberKey::ExprType(LuaType::Unknown)
+                    LuaMemberKey::ExprType(Box::new(LuaType::Unknown))
                 } else {
-                    LuaMemberKey::ExprType(expr_type)
+                    LuaMemberKey::ExprType(Box::new(expr_type))
                 }
             }
         }
@@ -227,7 +247,7 @@ impl LuaMemberKey {
 
     pub fn get_name(&self) -> Option<&str> {
         match self {
-            LuaMemberKey::Name(name) => Some(name.as_ref()),
+            LuaMemberKey::Name(name) => Some(name.as_str()),
             _ => None,
         }
     }
@@ -267,7 +287,7 @@ impl Ord for LuaMemberKey {
             (Integer(a), Integer(b)) => a.cmp(b),
             (Integer(_), _) => std::cmp::Ordering::Less,
             (_, Integer(_)) => std::cmp::Ordering::Greater,
-            (Name(a), Name(b)) => a.cmp(b),
+            (Name(a), Name(b)) => a.as_str().cmp(b.as_str()),
             (Name(_), _) => std::cmp::Ordering::Less,
             (_, Name(_)) => std::cmp::Ordering::Greater,
             // Reporting `Equal` for two different computed keys made this a
@@ -284,7 +304,7 @@ impl Ord for LuaMemberKey {
 
 impl From<String> for LuaMemberKey {
     fn from(name: String) -> Self {
-        LuaMemberKey::Name(name.into())
+        LuaMemberKey::name(name)
     }
 }
 
@@ -296,6 +316,41 @@ impl From<i64> for LuaMemberKey {
 
 impl From<&str> for LuaMemberKey {
     fn from(name: &str) -> Self {
-        LuaMemberKey::Name(name.to_string().into())
+        LuaMemberKey::name(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_index::derivation::fingerprint_of;
+
+    #[test]
+    fn member_key_fingerprints_hash_variant_and_payload() {
+        #[derive(Hash)]
+        enum UninternedKey<'a> {
+            None,
+            Integer(i64),
+            Name(&'a SmolStr),
+            ExprType(&'a LuaType),
+        }
+
+        let name = SmolStr::new("a member name longer than an inline string");
+        let typ = LuaType::Integer;
+        for (key, uninterned) in [
+            (LuaMemberKey::None, UninternedKey::None),
+            (LuaMemberKey::Integer(42), UninternedKey::Integer(42)),
+            (LuaMemberKey::name(name.clone()), UninternedKey::Name(&name)),
+            (
+                LuaMemberKey::ExprType(Box::new(typ.clone())),
+                UninternedKey::ExprType(&typ),
+            ),
+        ] {
+            assert_eq!(fingerprint_of(&key), fingerprint_of(&uninterned), "{key:?}");
+        }
+
+        let z = LuaMemberKey::name("z");
+        let a = LuaMemberKey::name("a");
+        assert!(a < z);
     }
 }

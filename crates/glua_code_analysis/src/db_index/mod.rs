@@ -27,12 +27,20 @@ mod reference;
 mod schema;
 mod semantic_decl;
 mod signature;
+mod site_list;
 mod traits;
 mod r#type;
 pub(crate) use intern::intern_smol_str;
 pub(crate) use query::QueryFamily;
 #[cfg(test)]
 pub(crate) use query::QueryStats;
+
+pub(crate) fn clear_thread_caches() {
+    r#type::clear_type_detail_memo();
+    intern::clear_smol_str_intern_cache();
+    r#type::clear_type_decl_id_intern_cache();
+    global::clear_global_id_intern_cache();
+}
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{path::PathBuf, sync::Arc};
@@ -68,6 +76,7 @@ pub use reference::*;
 pub use schema::*;
 pub use semantic_decl::*;
 pub use signature::*;
+pub use site_list::SiteList;
 pub use traits::LuaIndex;
 pub use r#type::*;
 
@@ -77,6 +86,11 @@ pub use r#type::*;
 /// (`Arc::make_mut`), so an unwritten domain is shared with the base index for
 /// free. [`DbIndex::fork_independent`] uses the same sharing for a long-lived
 /// copy.
+pub(crate) enum NetCallLookup<T> {
+    TargetOnly(crate::InFiled<rowan::TextRange>),
+    Full(Arc<T>),
+}
+
 #[derive(Debug)]
 pub struct DbIndex {
     decl_index: Arc<LuaDeclIndex>,
@@ -338,6 +352,12 @@ impl DbIndex {
         Arc::make_mut(&mut self.derivations)
     }
 
+    /// Frees the reader graph's ephemeral fingerprint cache once diagnostics
+    /// have settled; re-enabled automatically on the next reanalysis.
+    pub fn release_fingerprint_cache(&mut self) -> bool {
+        self.reader_graph_mut().release_fingerprint_cache()
+    }
+
     /// Restores a primary fact to its source-layer value, dropping what every
     /// derivation stored under it. The engine re-runs all of the key's
     /// producers afterwards, so a multi-writer key is rebuilt in canonical
@@ -345,7 +365,9 @@ impl DbIndex {
     pub(crate) fn reset_fact(&mut self, key: &derivation::FactKey) {
         use derivation::FactKey as K;
         match key {
-            K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
+            K::TypeCache(owner) => self
+                .get_type_index_mut()
+                .reset_type_cache(&owner.to_owner()),
             K::TypeFallbacks(file_id) => self.get_type_index_mut().retract_fallbacks(*file_id),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
             K::RoleMentions(file_id) => self.remove_role_mentions(*file_id),
@@ -504,7 +526,7 @@ impl DbIndex {
             if fingerprint == stored {
                 continue;
             }
-            derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+            derivation::note_write(|| derivation::FactKey::call_role(key.clone()));
             if fingerprint == derivation::ABSENT {
                 self.call_role_fingerprints.remove(key);
             } else {
@@ -843,9 +865,16 @@ impl DbIndex {
         &self,
         file_id: FileId,
         range: rowan::TextRange,
-    ) -> Option<Arc<T>> {
+    ) -> Option<NetCallLookup<T>> {
         derivation::note_read(|| derivation::FactKey::NetCall(crate::InFiled::new(file_id, range)));
-        self.net_site(net_site::NetSiteKind::Call, file_id, range)
+        match self.net_sites.get(&file_id)?.get_call(range)? {
+            net_site::StoredNetCall::TargetOnly(target) => {
+                Some(NetCallLookup::TargetOnly(target.clone()))
+            }
+            net_site::StoredNetCall::Full(site) => {
+                Some(NetCallLookup::Full(downcast_fact(&site.0)?))
+            }
+        }
     }
 
     /// `site`'s file's net helpers, read as the one summary of the body at
@@ -855,16 +884,7 @@ impl DbIndex {
         site: &crate::InFiled<rowan::TextRange>,
     ) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::NetHelper(site.clone()));
-        self.net_site(net_site::NetSiteKind::Helper, site.file_id, site.value)
-    }
-
-    fn net_site<T: derivation::DerivedFact>(
-        &self,
-        kind: net_site::NetSiteKind,
-        file_id: FileId,
-        range: rowan::TextRange,
-    ) -> Option<Arc<T>> {
-        let (fact, _) = self.net_sites.get(&file_id)?.get(kind, range)?;
+        let (fact, _) = self.net_sites.get(&site.file_id)?.get_helper(site.value)?;
         downcast_fact(fact)
     }
 
@@ -875,8 +895,29 @@ impl DbIndex {
     ) -> derivation::Fingerprint {
         self.net_sites
             .get(&site.file_id)
-            .and_then(|sites| sites.get(kind, site.value))
-            .map_or(derivation::ABSENT, stored_fact_fingerprint)
+            .and_then(|sites| sites.site_fingerprint(site.file_id, kind, site.value))
+            .unwrap_or(derivation::ABSENT)
+    }
+
+    /// Stores the net fact of a target-only call (no net role, not a helper
+    /// candidate) inline with no heap allocation.
+    pub(crate) fn set_net_call_target_only(
+        &mut self,
+        file_id: FileId,
+        range: rowan::TextRange,
+        target: crate::InFiled<rowan::TextRange>,
+    ) {
+        derivation::note_write(|| net_site::NetSiteKind::Call.key(file_id, range));
+        let sites = Arc::make_mut(self.net_sites.entry(file_id).or_default());
+        let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
+        sites.insert_call(
+            file_id,
+            range,
+            net_site::StoredNetCall::TargetOnly(target),
+            &mut linked,
+            &mut unlinked,
+        );
+        self.relink_net_sites(file_id, linked, unlinked);
     }
 
     /// Stores the net fact of the call at `range` of `file_id`.
@@ -886,7 +927,7 @@ impl DbIndex {
         range: rowan::TextRange,
         fact: Arc<T>,
     ) {
-        self.store_net_site(net_site::NetSiteKind::Call, file_id, range, fact);
+        self.store_net_call(file_id, range, fact);
     }
 
     /// Stores the net summary of the function body at `range` of `file_id`.
@@ -896,23 +937,41 @@ impl DbIndex {
         range: rowan::TextRange,
         summary: Arc<T>,
     ) {
-        self.store_net_site(net_site::NetSiteKind::Helper, file_id, range, summary);
+        self.store_net_helper(file_id, range, summary);
     }
 
-    fn store_net_site(
+    fn store_net_call(
         &mut self,
-        kind: net_site::NetSiteKind,
         file_id: FileId,
         range: rowan::TextRange,
         fact: Arc<dyn derivation::DerivedFact>,
     ) {
-        derivation::note_write(|| kind.key(file_id, range));
+        derivation::note_write(|| net_site::NetSiteKind::Call.key(file_id, range));
         let fingerprint = derivation::in_file(Some(file_id), || fact.fingerprint()).max(1);
         let sites = Arc::make_mut(self.net_sites.entry(file_id).or_default());
         let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
-        sites.insert(
+        sites.insert_call(
             file_id,
-            kind,
+            range,
+            net_site::StoredNetCall::Full(Box::new((fact, fingerprint))),
+            &mut linked,
+            &mut unlinked,
+        );
+        self.relink_net_sites(file_id, linked, unlinked);
+    }
+
+    fn store_net_helper(
+        &mut self,
+        file_id: FileId,
+        range: rowan::TextRange,
+        fact: Arc<dyn derivation::DerivedFact>,
+    ) {
+        derivation::note_write(|| net_site::NetSiteKind::Helper.key(file_id, range));
+        let fingerprint = derivation::in_file(Some(file_id), || fact.fingerprint()).max(1);
+        let sites = Arc::make_mut(self.net_sites.entry(file_id).or_default());
+        let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
+        sites.insert_helper(
+            file_id,
             range,
             (fact, fingerprint),
             &mut linked,
@@ -930,7 +989,7 @@ impl DbIndex {
         let Some(sites) = self.net_sites.get_mut(&site.file_id) else {
             return;
         };
-        if sites.get(kind, site.value).is_none() {
+        if !sites.contains(kind, site.value) {
             return;
         }
         let mut unlinked = Vec::new();
@@ -948,7 +1007,7 @@ impl DbIndex {
             return;
         };
         if derivation::recording() {
-            for (kind, range, _) in sites.sorted() {
+            for (kind, range) in sites.sorted_keys() {
                 derivation::note_write(|| kind.key(file_id, range));
             }
         }
@@ -989,18 +1048,40 @@ impl DbIndex {
             let Some(sites) = self.net_sites.get(&holder) else {
                 continue;
             };
-            let mut moved = Vec::new();
-            for (kind, range, (fact, _)) in sites.sorted() {
-                match fact.remap(remap) {
-                    crate::Remap::Moved(fact) => moved.push((kind, range, fact)),
-                    crate::Remap::Lost => {
-                        lost.push(crate::LostFact::new(holder, kind.key(holder, range)))
-                    }
+            let mut moved_calls = Vec::new();
+            let mut moved_helpers = Vec::new();
+            for (range, call) in sites.sorted_calls() {
+                match call.remap(remap) {
+                    crate::Remap::Moved(call) => moved_calls.push((range, call)),
+                    crate::Remap::Lost => lost.push(crate::LostFact::new(
+                        holder,
+                        net_site::NetSiteKind::Call.key(holder, range),
+                    )),
                     crate::Remap::Unrelated => {}
                 }
             }
-            for (kind, range, fact) in moved {
-                self.store_net_site(kind, holder, range, fact);
+            for (range, (fact, _)) in sites.sorted_helpers() {
+                match fact.remap(remap) {
+                    crate::Remap::Moved(fact) => moved_helpers.push((range, fact)),
+                    crate::Remap::Lost => lost.push(crate::LostFact::new(
+                        holder,
+                        net_site::NetSiteKind::Helper.key(holder, range),
+                    )),
+                    crate::Remap::Unrelated => {}
+                }
+            }
+            for (range, call) in moved_calls {
+                match call {
+                    net_site::StoredNetCall::TargetOnly(target) => {
+                        self.set_net_call_target_only(holder, range, target);
+                    }
+                    net_site::StoredNetCall::Full(site) => {
+                        self.store_net_call(holder, range, site.0);
+                    }
+                }
+            }
+            for (range, fact) in moved_helpers {
+                self.store_net_helper(holder, range, fact);
             }
         }
         lost
@@ -1939,12 +2020,12 @@ mod tests {
         db.reader_graph_mut().intern_read(rule.clone());
         let at_open = db
             .reader_graph()
-            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key));
 
         db.set_analysis_stage(AnalysisStage::Closed);
         let at_closed = db
             .reader_graph()
-            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key));
 
         assert_ne!(at_open, db.fact_fingerprint(rule.key()), "the rule moves");
         assert_eq!(at_closed, db.fact_fingerprint(rule.key()));

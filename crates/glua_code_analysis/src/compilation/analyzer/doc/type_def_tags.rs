@@ -215,7 +215,7 @@ fn analyze_enum_fields(
             continue;
         };
 
-        let key = LuaMemberKey::Name(name_token.get_name_text().to_string().into());
+        let key = LuaMemberKey::name(name_token.get_name_text().to_string());
         let member_id = LuaMemberId::new(field.get_syntax_id(), file_id);
         let member = LuaMember::new(member_id, key.clone(), decl_feature, None);
 

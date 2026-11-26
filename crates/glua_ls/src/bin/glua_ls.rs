@@ -4,12 +4,20 @@ use glua_ls::cmd_args::CmdArgs;
 use mimalloc::MiMalloc;
 use std::error::Error;
 
+#[cfg(not(feature = "alloc-sample"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+#[cfg(feature = "alloc-sample")]
+#[global_allocator]
+static GLOBAL: glua_ls::alloc_sample::SamplingAlloc =
+    glua_ls::alloc_sample::SamplingAlloc(MiMalloc);
 
 /// Analysis runs on every runtime thread, so each one, like the thread
 /// driving the runtime, gets [`ANALYSIS_STACK_SIZE`].
 fn main() {
+    #[cfg(feature = "alloc-sample")]
+    glua_ls::alloc_sample::init();
     std::thread::Builder::new()
         .stack_size(ANALYSIS_STACK_SIZE)
         .spawn(serve)

@@ -176,13 +176,182 @@ pub enum CallRoleKey {
     Signature(LuaSignatureId),
 }
 
+/// Interned string key for [`FactKey`] variants (8 bytes instead of 24-byte
+/// `SmolStr`, keeping [`FactKey`] at 24 bytes and [`KeySlot`] at 80 bytes).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FactName(internment::ArcIntern<SmolStr>);
+
+impl FactName {
+    pub fn new(name: &str) -> Self {
+        Self(crate::db_index::intern_smol_str(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::ops::Deref for FactName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<str> for FactName {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for FactName {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for FactName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for FactName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for FactName {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<SmolStr> for FactName {
+    fn from(name: SmolStr) -> Self {
+        Self::new(name.as_str())
+    }
+}
+
+impl From<&SmolStr> for FactName {
+    fn from(name: &SmolStr) -> Self {
+        Self::new(name.as_str())
+    }
+}
+
+impl From<String> for FactName {
+    fn from(name: String) -> Self {
+        Self::new(&name)
+    }
+}
+
+impl From<&String> for FactName {
+    fn from(name: &String) -> Self {
+        Self::new(name.as_str())
+    }
+}
+
+impl FactName {
+    pub fn as_smol_str(&self) -> &SmolStr {
+        &self.0
+    }
+}
+
+/// Compact 20-byte representation of [`LuaTypeOwner`] for [`FactKey::TypeCache`],
+/// packing `LuaMemberId`'s `slot` as `u16` alongside `LuaKind` so `FactKey`
+/// fits in 24 bytes without heap-allocating the most frequent key variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactTypeOwner {
+    Decl(LuaDeclId),
+    Member {
+        file_id: FileId,
+        range: TextRange,
+        kind: glua_parser::LuaKind,
+        slot: u16,
+    },
+    SyntaxId {
+        file_id: FileId,
+        syntax_id: LuaSyntaxId,
+    },
+}
+
+const _: () = assert!(std::mem::size_of::<CompactTypeOwner>() == 20);
+
+impl CompactTypeOwner {
+    pub fn from_owner(owner: &LuaTypeOwner) -> Self {
+        match owner {
+            LuaTypeOwner::Decl(id) => Self::Decl(*id),
+            LuaTypeOwner::Member(id) => {
+                let syntax = *id.get_syntax_id();
+                Self::Member {
+                    file_id: id.file_id,
+                    range: syntax.get_range(),
+                    kind: syntax.raw_kind(),
+                    slot: u16::try_from(id.get_slot()).expect("member slot fits in u16"),
+                }
+            }
+            LuaTypeOwner::SyntaxId(id) => Self::SyntaxId {
+                file_id: id.file_id,
+                syntax_id: id.value,
+            },
+        }
+    }
+
+    pub fn to_owner(self) -> LuaTypeOwner {
+        match self {
+            Self::Decl(id) => LuaTypeOwner::Decl(id),
+            Self::Member {
+                file_id,
+                range,
+                kind,
+                slot,
+            } => LuaTypeOwner::Member(LuaMemberId::new_in_slot(
+                LuaSyntaxId::new(kind, range),
+                file_id,
+                u32::from(slot),
+            )),
+            Self::SyntaxId { file_id, syntax_id } => {
+                LuaTypeOwner::SyntaxId(InFiled::new(file_id, syntax_id))
+            }
+        }
+    }
+
+    pub fn get_file_id(&self) -> FileId {
+        match self {
+            Self::Decl(id) => id.file_id,
+            Self::Member { file_id, .. } => *file_id,
+            Self::SyntaxId { file_id, .. } => *file_id,
+        }
+    }
+}
+
+impl From<LuaTypeOwner> for CompactTypeOwner {
+    fn from(owner: LuaTypeOwner) -> Self {
+        Self::from_owner(&owner)
+    }
+}
+
+impl From<&LuaTypeOwner> for CompactTypeOwner {
+    fn from(owner: &LuaTypeOwner) -> Self {
+        Self::from_owner(owner)
+    }
+}
+
+impl PartialEq<LuaTypeOwner> for CompactTypeOwner {
+    fn eq(&self, other: &LuaTypeOwner) -> bool {
+        self.to_owner() == *other
+    }
+}
+
 /// One readable fact. Every analysis read of an index lands on exactly one
 /// key, and [`crate::DbIndex::fact_fingerprint`] hashes exactly what a read
 /// of that key can observe.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FactKey {
     /// A stored type and its fact metadata.
-    TypeCache(LuaTypeOwner),
+    TypeCache(CompactTypeOwner),
     /// The types a file's local fallbacks published over what its statements
     /// left (see [`writes_fallback_of`]).
     TypeFallbacks(FileId),
@@ -257,7 +426,7 @@ pub enum FactKey {
     /// [`FactKey::Member`].
     MemberMarks(LuaMemberId),
     /// The visible members of one owner under one key.
-    MemberSlot(LuaMemberOwner, LuaMemberKey),
+    MemberSlot(Box<(LuaMemberOwner, LuaMemberKey)>),
     /// Every member of one owner.
     MemberOwnerMap(LuaMemberOwner),
     /// The members of one owner whose key is an expression.
@@ -268,7 +437,7 @@ pub enum FactKey {
     /// Whether one owner has a member map at all.
     MemberOwnerPresence(LuaMemberOwner),
     /// Every current member under one key, across owners.
-    MemberKey(LuaMemberKey),
+    MemberKey(Box<LuaMemberKey>),
     /// A file's members and member-function scopes.
     MemberFile(FileId),
     /// A global path's definition sites, class and provenance.
@@ -286,11 +455,11 @@ pub enum FactKey {
     /// The files that have valid-guard signatures.
     ValidGuardFiles,
     /// Whether a definition of this name is marked `valid_guard`.
-    ValidGuardName(SmolStr),
+    ValidGuardName(FactName),
     /// A file's signatures and receiver out-param names.
     SignatureFile(FileId),
     /// Out-param member names a receiver type is known to carry.
-    ReceiverOutParam(SmolStr),
+    ReceiverOutParam(FactName),
     /// A call-site-inferred parameter of a callee.
     Contrib(LuaSignatureId, usize),
     /// The call-site parameter evidence one file holds, every call's and its
@@ -308,11 +477,11 @@ pub enum FactKey {
     ModuleMeta(FileId),
     /// The modules whose name (last path segment) is this: every module
     /// lookup of a path ending in it.
-    ModuleName(SmolStr),
+    ModuleName(FactName),
     /// The modules filed at one full module path.
-    ModulePath(SmolStr),
+    ModulePath(FactName),
     /// The legacy `module()` namespaces under this first path segment.
-    ModuleNamespace(SmolStr),
+    ModuleNamespace(FactName),
     /// The set of modules: their files, paths and workspaces.
     ModuleFiles,
     /// One call site's special-call facts.
@@ -322,21 +491,21 @@ pub enum FactKey {
     /// The special-call effects of one file that narrow one variable
     /// reference: their positions and targets, read out of its
     /// [`FactKey::SpecialCallFile`].
-    SpecialCallFor(FileId, crate::VarRefId),
+    SpecialCallFor(FileId, Box<crate::VarRefId>),
     /// What the callee of one call resolves to.
     CallTarget(InFiled<TextRange>),
     /// A file's flow tree and casts.
     FlowTree(FileId),
     /// One dynamic field (`None`: the owner's named fields as a whole).
-    DynamicField(DynamicFieldOwner, Option<SmolStr>),
+    DynamicField(Box<(DynamicFieldOwner, Option<FactName>)>),
     /// An owner's wildcard (dynamic-key) definition sites.
     DynamicFieldWildcards(DynamicFieldOwner),
     /// An owner's members written through a finite set of names.
     DynamicFieldFinite(DynamicFieldOwner),
     /// The types that hold a direct dynamic field, by name.
-    DynamicFieldName(SmolStr),
+    DynamicFieldName(FactName),
     /// An unattributed dynamic field, by name.
-    UnattributedField(SmolStr),
+    UnattributedField(FactName),
     /// One operand owner's operator table.
     OperatorOwner(LuaOperatorOwner),
     /// A file's operators.
@@ -348,7 +517,7 @@ pub enum FactKey {
     /// A file's setmetatable factory bindings.
     MetatableFactory(FileId),
     /// Name-keyed gmod metadata (vgui panels, derma skins, net/system names).
-    GmodMeta(SmolStr),
+    GmodMeta(FactName),
     /// A file's gmod class call metadata.
     GmodClassFile(FileId),
     /// A file's `vgui.Register` and `derma.DefineControl` calls, read out of
@@ -388,7 +557,7 @@ pub enum FactKey {
     /// The gmod realm and hook aggregates across files.
     GmodInferScan,
     /// The gmod system registrations of one kind under one name, across files.
-    GmodSystem(crate::db_index::GmodSystemRegistrationKind, SmolStr),
+    GmodSystem(crate::db_index::GmodSystemRegistrationKind, FactName),
     /// A file's load edges, roots and execution environment.
     GmodLoadFile(FileId),
     /// A file's own contribution to the load graph: its execution-environment
@@ -401,16 +570,16 @@ pub enum FactKey {
     /// Network flows by message name (whole-map).
     NetworkScan,
     /// The network flows sent under one message name.
-    NetSends(SmolStr),
+    NetSends(FactName),
     /// The network flows received under one message name.
-    NetReceives(SmolStr),
+    NetReceives(FactName),
     /// Whether flows elsewhere materialize the net send defined at a site,
     /// which then stands for them.
     NetDefinitionUses(InFiled<TextRange>),
     /// The workspace net-helper registry.
     HelperRegistry,
     /// One entry of the workspace call roles and net-helper registry.
-    CallRole(CallRoleKey),
+    CallRole(Box<CallRoleKey>),
     /// The global paths one file's syntax names.
     RoleMentions(FileId),
     /// One file's gmod helper scan: its call roles and net-helper definitions.
@@ -418,7 +587,7 @@ pub enum FactKey {
     /// The set of files that have a gmod helper scan.
     HelperScanFiles,
     /// Whether a name names a function that can produce a net operation.
-    NetHelperName(SmolStr),
+    NetHelperName(FactName),
     /// The names the net operations are declared under.
     NetOperationNames,
     /// What one call is in the net subsystem: its role, the function body it
@@ -431,11 +600,11 @@ pub enum FactKey {
     /// A file's function-body summaries, from its syntax and local references.
     FunctionSummaries(FileId),
     /// A property (docs, attributes, visibility) of a semantic declaration.
-    Property(LuaSemanticDeclId),
+    Property(Box<LuaSemanticDeclId>),
     /// A declaration's inferred string default.
     DeclDefault(LuaDeclId),
     /// Global declarations of one name.
-    Global(SmolStr),
+    Global(FactName),
     /// Every global declaration (whole-map enumeration).
     GlobalScan,
     /// A file's reference index.
@@ -444,14 +613,14 @@ pub enum FactKey {
     /// file's [`FactKey::References`].
     DeclReferences(LuaDeclId),
     /// Name-keyed references across files.
-    ReferencesByName(SmolStr),
-    IndexReferenceFiles(SmolStr),
+    ReferencesByName(FactName),
+    IndexReferenceFiles(FactName),
     /// The member-key references derivations resolved in one file.
     DerivedReferences(FileId),
     /// Numeric-range populations of one global table.
-    NumericPopulation(SmolStr),
+    NumericPopulation(FactName),
     /// Accessor-function annotations of one function name.
-    AccessorFunc(SmolStr),
+    AccessorFunc(FactName),
     /// A file's accessor-function calls.
     AccessorCalls(FileId),
     /// A file's dependency edges and the sites that name it.
@@ -482,6 +651,39 @@ pub enum FactKey {
     CallbackParams(LuaSignatureId),
 }
 
+const _: () = assert!(std::mem::size_of::<FactKey>() <= 24);
+const _: () = assert!(std::mem::size_of::<Option<HashedKey>>() <= 32);
+
+impl FactKey {
+    pub fn type_cache(owner: &LuaTypeOwner) -> Self {
+        Self::TypeCache(CompactTypeOwner::from_owner(owner))
+    }
+
+    pub fn special_call_for(file_id: FileId, var_ref_id: crate::VarRefId) -> Self {
+        Self::SpecialCallFor(file_id, Box::new(var_ref_id))
+    }
+
+    pub fn property(owner: LuaSemanticDeclId) -> Self {
+        Self::Property(Box::new(owner))
+    }
+
+    pub fn member_slot(owner: LuaMemberOwner, key: LuaMemberKey) -> Self {
+        Self::MemberSlot(Box::new((owner, key)))
+    }
+
+    pub fn member_key(key: LuaMemberKey) -> Self {
+        Self::MemberKey(Box::new(key))
+    }
+
+    pub fn dynamic_field(owner: DynamicFieldOwner, name: Option<FactName>) -> Self {
+        Self::DynamicField(Box::new((owner, name)))
+    }
+
+    pub fn call_role(key: CallRoleKey) -> Self {
+        Self::CallRole(Box::new(key))
+    }
+}
+
 /// A fact key with its hash taken once, so the sets and maps that record,
 /// fingerprint and index it do not hash the key again.
 #[derive(Debug, Clone)]
@@ -492,11 +694,15 @@ pub struct HashedKey {
 
 impl HashedKey {
     pub fn new(key: FactKey) -> Self {
-        use std::hash::BuildHasher;
         Self {
-            hash: rustc_hash::FxBuildHasher.hash_one(&key),
+            hash: Self::hash_fact(&key),
             key,
         }
+    }
+
+    fn hash_fact(key: &FactKey) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(key)
     }
 
     pub fn key(&self) -> &FactKey {
@@ -801,9 +1007,12 @@ impl FactKey {
     /// renames: the owning file, or the file of a positional property owner.
     pub fn positional_file(&self) -> Option<FileId> {
         match self {
-            FactKey::Property(LuaSemanticDeclId::Member(id)) => Some(id.file_id),
-            FactKey::Property(LuaSemanticDeclId::LuaDecl(id)) => Some(id.file_id),
-            FactKey::Property(LuaSemanticDeclId::Signature(id)) => Some(id.get_file_id()),
+            FactKey::Property(id) => match id.as_ref() {
+                LuaSemanticDeclId::Member(id) => Some(id.file_id),
+                LuaSemanticDeclId::LuaDecl(id) => Some(id.file_id),
+                LuaSemanticDeclId::Signature(id) => Some(id.get_file_id()),
+                LuaSemanticDeclId::TypeDecl(_) => None,
+            },
             FactKey::NetDefinitionUses(site) => Some(site.file_id),
             _ => self.owning_file(),
         }
@@ -813,8 +1022,14 @@ impl FactKey {
     /// filed under, which can name other files' table literals.
     pub fn expr_key_type(&self) -> Option<&crate::LuaType> {
         match self {
-            FactKey::MemberSlot(_, LuaMemberKey::ExprType(typ))
-            | FactKey::MemberKey(LuaMemberKey::ExprType(typ)) => Some(typ),
+            FactKey::MemberSlot(boxed) => match &boxed.1 {
+                LuaMemberKey::ExprType(typ) => Some(typ),
+                _ => None,
+            },
+            FactKey::MemberKey(boxed) => match boxed.as_ref() {
+                LuaMemberKey::ExprType(typ) => Some(typ),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -887,8 +1102,11 @@ impl FactKey {
             K::GmodRealmAt(file_id, _)
             | K::GmodMemberRealmAt(file_id, _)
             | K::GmodRealmInputs(file_id) => Some(*file_id),
-            K::MemberSlot(owner, _)
-            | K::MemberOwnerMap(owner)
+            K::MemberSlot(boxed) => match &boxed.0 {
+                LuaMemberOwner::Element(site) => Some(site.file_id),
+                _ => None,
+            },
+            K::MemberOwnerMap(owner)
             | K::MemberOwnerExprKeys(owner)
             | K::MemberOwnerFields(owner)
             | K::MemberOwnerPresence(owner) => match owner {
@@ -910,8 +1128,14 @@ impl FactKey {
             | K::InferredGuard(signature_id)
             | K::Contrib(signature_id, _)
             | K::ReceiverAuthority(signature_id)
-            | K::CallbackParams(signature_id)
-            | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),
+            | K::CallbackParams(signature_id) => Some(signature_id.get_file_id()),
+            K::CallRole(boxed) => match boxed.as_ref() {
+                CallRoleKey::Signature(signature_id) => Some(signature_id.get_file_id()),
+                CallRoleKey::Path(_)
+                | CallRoleKey::ReceiverMethod(_)
+                | CallRoleKey::Global(_)
+                | CallRoleKey::Method(_) => None,
+            },
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
             | K::SpecialCallFor(file_id, _)
@@ -949,8 +1173,11 @@ impl FactKey {
             | K::DerivedReferences(file_id)
             | K::FileText(file_id)
             | K::FilePath(file_id) => Some(*file_id),
-            K::DynamicField(DynamicFieldOwner::Table(site), _)
-            | K::DynamicFieldWildcards(DynamicFieldOwner::Table(site))
+            K::DynamicField(boxed) => match &boxed.0 {
+                DynamicFieldOwner::Table(site) => Some(site.file_id),
+                _ => None,
+            },
+            K::DynamicFieldWildcards(DynamicFieldOwner::Table(site))
             | K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => Some(site.file_id),
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),
             K::TypeDecl(_)
@@ -971,7 +1198,6 @@ impl FactKey {
             | K::ModulePath(_)
             | K::ModuleNamespace(_)
             | K::ModuleFiles
-            | K::DynamicField(..)
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)
             | K::DynamicFieldName(_)
@@ -987,12 +1213,6 @@ impl FactKey {
             | K::NetReceives(_)
             | K::NetDefinitionUses(_)
             | K::HelperRegistry
-            | K::CallRole(
-                CallRoleKey::Path(_)
-                | CallRoleKey::ReceiverMethod(_)
-                | CallRoleKey::Global(_)
-                | CallRoleKey::Method(_),
-            )
             | K::HelperScanFiles
             | K::LoadScanFiles
             | K::FileSet
@@ -1168,6 +1388,8 @@ pub struct DerivationId {
     start: u32,
     end: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<DerivationId>() == 16);
 
 impl DerivationId {
     pub fn new(kind: DerivationKind, file_id: FileId, syntax: LuaSyntaxId) -> Self {
@@ -1423,7 +1645,7 @@ impl Evaluation {
     pub fn fingerprint_unlent_reads(
         &self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
     ) {
         for key in &self.reads {
             if let Some(slot) = graph.find_slot(key)
@@ -1452,7 +1674,7 @@ impl Evaluation {
             if self.staged.contains_key(key) {
                 continue;
             }
-            if !records_read(id, key, |key| contains_hashed(&self.outputs, key)) {
+            if !records_read(id, key, |_| contains_hashed(&self.outputs, key)) {
                 continue;
             }
             self.staged.insert(key.clone(), fingerprint(key));
@@ -1528,12 +1750,21 @@ impl Evaluation {
         (id, slots, reads, outputs)
     }
 
+    pub(crate) fn elide_diagnostic_reads(&mut self, graph: &ReaderGraph) {
+        let file_id = self.id.file_id;
+        let retain = |key: &FactKey| {
+            key.owning_file() != Some(file_id) || matches!(key, FactKey::FilePath(_))
+        };
+        self.reads.retain(|key| retain(key));
+        self.viewed.retain(|slot| retain(graph.key(*slot)));
+    }
+
     /// The reads of an evaluation that viewed `graph` (see [`view_graph`]),
     /// each fingerprinted as it stands.
     pub fn into_viewed_reads(
         mut self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
     ) -> ViewedReads {
         let id = self.id;
         // A key read before the graph was viewed is a slot read if it has one.
@@ -1564,6 +1795,7 @@ impl Evaluation {
             slots,
             seen,
             keys: keys.into_boxed_slice(),
+            file_revision: None,
         }
     }
 
@@ -1584,7 +1816,7 @@ impl Evaluation {
         let reads = self
             .reads
             .drain()
-            .filter(|key| records_read(id, key, |key| contains_hashed(&self.outputs, key)))
+            .filter(|key| records_read(id, key, |_| contains_hashed(&self.outputs, key)))
             .map(|key| {
                 let seen = self
                     .staged
@@ -1609,6 +1841,7 @@ pub struct ViewedReads {
     slots: Box<[KeyIdx]>,
     seen: Box<[Fingerprint]>,
     keys: Box<[(HashedKey, Fingerprint)]>,
+    pub(crate) file_revision: Option<u64>,
 }
 
 impl ViewedReads {
@@ -1618,6 +1851,7 @@ impl ViewedReads {
             slots: Box::default(),
             seen: Box::default(),
             keys: keys.into_boxed_slice(),
+            file_revision: None,
         }
     }
 
@@ -1646,7 +1880,7 @@ impl ViewedReads {
     pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
         self.slots
             .iter()
-            .map(|slot| graph.key(*slot).key())
+            .map(|slot| graph.key(*slot))
             .chain(self.keys.iter().map(|(key, _)| key.key()))
     }
 }
@@ -1657,8 +1891,8 @@ impl ViewedReads {
 /// before any of its file's derivations.
 pub(crate) fn records_read(
     id: DerivationId,
-    key: &HashedKey,
-    is_output: impl Fn(&HashedKey) -> bool,
+    key: &FactKey,
+    is_output: impl Fn(&FactKey) -> bool,
 ) -> bool {
     let own = key.owning_file() == Some(id.file_id);
     !(key.is_primary() && is_output(key))
@@ -1668,11 +1902,15 @@ pub(crate) fn records_read(
 /// Whether `key` is one of `sorted`, a vec sorted by [`HashedKey`]'s stored
 /// hash and deduplicated.
 fn contains_hashed(sorted: &[HashedKey], key: &HashedKey) -> bool {
-    let start = sorted.partition_point(|probe| probe.hash < key.hash);
+    contains_fact(sorted, key.key(), key.hash)
+}
+
+fn contains_fact(sorted: &[HashedKey], key: &FactKey, hash: u64) -> bool {
+    let start = sorted.partition_point(|probe| probe.hash < hash);
     sorted[start..]
         .iter()
-        .take_while(|probe| probe.hash == key.hash)
-        .any(|probe| probe == key)
+        .take_while(|probe| probe.hash == hash)
+        .any(|probe| probe.key() == key)
 }
 
 thread_local! {
@@ -2196,7 +2434,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
             // its key hash names it again without probing the table's index.
             let seen = evaluation
                 .seen_slots
-                .find(key.hash, |entry| table.live_key(entry.1) == Some(&key))
+                .find(key.hash, |entry| table.live_key(entry.1) == Some(key.key()))
                 .map(|entry| entry.1);
             let slot = match seen {
                 Some(slot) => slot,
@@ -2344,7 +2582,7 @@ pub fn note_member_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
         LuaMemberKey::Name(name) => Some(name.as_str()),
         LuaMemberKey::None => None,
         LuaMemberKey::Integer(_) | LuaMemberKey::ExprType(_) => {
-            note_read(|| FactKey::MemberSlot(owner.clone(), key.clone()));
+            note_read(|| FactKey::member_slot(owner.clone(), key.clone()));
             return;
         }
     };
@@ -2355,7 +2593,7 @@ pub fn note_member_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
         LuaMemberOwner::LocalUnresolve => owner_identity(4, 0),
     };
     note_named_read(u8::MAX - 17, owner_id, name, || {
-        FactKey::MemberSlot(owner.clone(), key.clone())
+        FactKey::member_slot(owner.clone(), key.clone())
     });
 }
 
@@ -2370,7 +2608,7 @@ pub fn note_dynamic_field_read(owner: &DynamicFieldOwner, name: Option<&str>) {
         DynamicFieldOwner::Table(site) => owner_identity(3, site_identity(site)),
     };
     note_named_read(u8::MAX - 18, owner_id, name, || {
-        FactKey::DynamicField(owner.clone(), name.map(SmolStr::new))
+        FactKey::dynamic_field(owner.clone(), name.map(FactName::new))
     });
 }
 
@@ -2634,8 +2872,9 @@ impl PartialEq for FactRead {
 impl FactRead {
     pub(crate) fn recomputes(&self, owner: &LuaTypeOwner) -> bool {
         use std::sync::atomic::Ordering;
+        let compact = CompactTypeOwner::from_owner(owner);
         if let Some(windowed) = transport::with_keys(|worker| {
-            worker.windowed(&HashedKey::new(FactKey::TypeCache(owner.clone())))
+            worker.windowed(&HashedKey::new(FactKey::TypeCache(compact)))
         }) {
             return windowed;
         }
@@ -2644,9 +2883,9 @@ impl FactRead {
                 table
                     .matching_slot(
                         self.0.load(Ordering::Relaxed),
-                        |fact| matches!(fact, FactKey::TypeCache(stored) if stored == owner),
+                        |fact| matches!(fact, FactKey::TypeCache(stored) if *stored == compact),
                     )
-                    .or_else(|| table.find(&HashedKey::new(FactKey::TypeCache(owner.clone()))))
+                    .or_else(|| table.find(&HashedKey::new(FactKey::TypeCache(compact))))
                     .is_some_and(|slot| table.windowed(slot))
             })
         })
@@ -2741,10 +2980,10 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
     match owner {
         LuaTypeOwner::Decl(id) => note_read_by(
             (u8::MAX - 5, file_position(id.file_id, id.position)),
-            || FactKey::TypeCache(owner.clone()),
+            || FactKey::type_cache(owner),
         ),
         LuaTypeOwner::Member(id) => {
-            note_member_read(u8::MAX - 6, id, || FactKey::TypeCache(owner.clone()))
+            note_member_read(u8::MAX - 6, id, || FactKey::type_cache(owner))
         }
         LuaTypeOwner::SyntaxId(id) => {
             let range = id.value.get_range();
@@ -2752,9 +2991,7 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
                 | u128::from(id.value.get_kind() as u16) << 64
                 | u128::from(u32::from(range.start())) << 32
                 | u128::from(u32::from(range.end()));
-            note_read_by((u8::MAX - 16, identity), || {
-                FactKey::TypeCache(owner.clone())
-            });
+            note_read_by((u8::MAX - 16, identity), || FactKey::type_cache(owner));
         }
     }
 }
@@ -2984,7 +3221,7 @@ mod member_read_tests {
         let mut read_keys = reads.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
         let mut expected = owners
             .iter()
-            .map(|owner| HashedKey::new(FactKey::TypeCache(owner.clone())))
+            .map(|owner| HashedKey::new(FactKey::type_cache(owner)))
             .collect::<Vec<_>>();
         read_keys.sort_by_key(|key| format!("{key:?}"));
         expected.sort_by_key(|key| format!("{key:?}"));

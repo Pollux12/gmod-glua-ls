@@ -30,3 +30,40 @@ pub(crate) fn intern_smol_str(name: &str) -> ArcIntern<SmolStr> {
         interned
     })
 }
+
+pub(crate) fn clear_smol_str_intern_cache() {
+    SMOL_STR.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.clear();
+        cache.shrink_to_fit();
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InternedName(pub(super) ArcIntern<SmolStr>);
+
+impl InternedName {
+    pub(super) fn new(name: &str) -> Self {
+        Self(intern_smol_str(name))
+    }
+}
+
+impl std::ops::Deref for InternedName {
+    type Target = SmolStr;
+
+    fn deref(&self) -> &SmolStr {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for InternedName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::hash::Hash for InternedName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}

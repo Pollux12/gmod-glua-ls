@@ -1007,7 +1007,7 @@ mod test {
 
         db.get_member_index_mut().add_member(
             LuaMemberOwner::Element(literal.clone()),
-            write(40, LuaMemberKey::ExprType(LuaType::Integer)),
+            write(40, LuaMemberKey::ExprType(Box::new(LuaType::Integer))),
         );
         assert_eq!(
             prune_redundant_guarded_table_bootstrap_type(&db, slot()),
@@ -1025,7 +1025,7 @@ mod test {
 
         db.get_member_index_mut().add_member(
             LuaMemberOwner::Element(literal.clone()),
-            write(80, LuaMemberKey::Name("count".into())),
+            write(80, LuaMemberKey::name("count")),
         );
         assert_eq!(
             prune_redundant_guarded_table_bootstrap_type(&db, slot()),

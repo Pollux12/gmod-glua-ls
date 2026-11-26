@@ -864,7 +864,7 @@ mod tests {
 
     #[gtest]
     fn push_unique_member_info_keeps_distinct_overload_indices() -> Result<()> {
-        let key = LuaMemberKey::Name("lookup".into());
+        let key = LuaMemberKey::name("lookup");
         let mut members = HashMap::default();
         let mut existing = collect_member_identities(&members);
 

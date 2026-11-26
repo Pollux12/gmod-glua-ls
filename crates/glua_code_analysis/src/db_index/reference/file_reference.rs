@@ -1,7 +1,7 @@
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::db_index::LuaDeclId;
+use crate::db_index::{LuaDeclId, SiteList};
 
 #[derive(Debug, Clone)]
 pub struct FileReference {
@@ -20,6 +20,29 @@ impl FileReference {
         Self {
             decl_references: HashMap::default(),
             references_to_decl: HashMap::default(),
+        }
+    }
+
+    pub(super) fn from_parts(
+        decl_references: HashMap<LuaDeclId, (Vec<DeclReferenceCell>, bool)>,
+        mut references_to_decl: HashMap<TextRange, LuaDeclId>,
+    ) -> Self {
+        let mut compacted =
+            HashMap::with_capacity_and_hasher(decl_references.len(), Default::default());
+        for (decl_id, (cells, mutable)) in decl_references {
+            compacted.insert(
+                decl_id,
+                DeclReference {
+                    cells: SiteList::from(cells),
+                    mutable,
+                },
+            );
+        }
+        compacted.shrink_to_fit();
+        references_to_decl.shrink_to_fit();
+        Self {
+            decl_references: compacted,
+            references_to_decl,
         }
     }
 
@@ -63,7 +86,7 @@ pub struct DeclReferenceCell {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeclReference {
-    pub cells: Vec<DeclReferenceCell>,
+    pub cells: SiteList<DeclReferenceCell>,
     pub mutable: bool,
 }
 
@@ -76,7 +99,7 @@ impl Default for DeclReference {
 impl DeclReference {
     pub fn new() -> Self {
         Self {
-            cells: Vec::new(),
+            cells: SiteList::default(),
             mutable: false,
         }
     }

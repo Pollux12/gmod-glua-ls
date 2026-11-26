@@ -2688,7 +2688,7 @@ pub fn infer_global_type(
 
 fn record_missing_global_read(db: &DbIndex, name: &str) {
     let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(name));
-    let key = LuaMemberKey::Name(name.into());
+    let key = LuaMemberKey::name(name);
     crate::semantic::member::record_member_slot_read(db, &owner, &key);
 }
 
@@ -3071,7 +3071,7 @@ fn infer_legacy_module_local_type(
     // fallback: cross-file member search via GlobalPath member index
     // (module-scoped decls in other files are stored under GlobalPath, not the global index)
     let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(&module_env.module_path));
-    let member_key = LuaMemberKey::Name(name.into());
+    let member_key = LuaMemberKey::name(name);
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key) {
         if let Ok(ty) = member_item.resolve_type_with_realm(db, &file_id) {
             return Some(ty);

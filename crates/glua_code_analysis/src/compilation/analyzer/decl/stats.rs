@@ -207,8 +207,8 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 }
                 let index_key = index_expr.get_index_key()?;
                 let key: LuaMemberKey = match index_key {
-                    LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
-                    LuaIndexKey::String(str) => LuaMemberKey::Name(str.get_value().into()),
+                    LuaIndexKey::Name(name) => LuaMemberKey::name(name.get_name_text()),
+                    LuaIndexKey::String(str) => LuaMemberKey::name(str.get_value()),
                     LuaIndexKey::Integer(i) => {
                         if let NumberResult::Int(idx) = i.get_number_value() {
                             LuaMemberKey::Integer(idx)
@@ -437,8 +437,8 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
         LuaVarExpr::IndexExpr(index_expr) => {
             let index_key = index_expr.get_index_key()?;
             let key: LuaMemberKey = match index_key {
-                LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
-                LuaIndexKey::String(str) => LuaMemberKey::Name(str.get_value().into()),
+                LuaIndexKey::Name(name) => LuaMemberKey::name(name.get_name_text()),
+                LuaIndexKey::String(str) => LuaMemberKey::name(str.get_value()),
                 LuaIndexKey::Integer(i) => {
                     if let NumberResult::Int(idx) = i.get_number_value() {
                         LuaMemberKey::Integer(idx)

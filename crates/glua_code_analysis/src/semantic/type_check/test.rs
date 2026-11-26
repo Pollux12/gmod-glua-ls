@@ -294,7 +294,7 @@ CONFIG.colors = {}
 
     fn object_with_field(name: &str, typ: LuaType) -> LuaType {
         let mut fields = BTreeMap::new();
-        fields.insert(LuaMemberKey::Name(name.into()), typ);
+        fields.insert(LuaMemberKey::name(name), typ);
         LuaObjectType::new_with_fields(fields, Vec::new()).into()
     }
 
@@ -327,7 +327,7 @@ CONFIG.colors = {}
         index_value_type: LuaType,
     ) -> LuaType {
         let mut fields = BTreeMap::new();
-        fields.insert(LuaMemberKey::Name(name.into()), field_type);
+        fields.insert(LuaMemberKey::name(name), field_type);
         LuaObjectType::new_with_fields(fields, vec![(index_key_type, index_value_type)]).into()
     }
 

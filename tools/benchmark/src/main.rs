@@ -5,6 +5,20 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 #[cfg(not(feature = "dhat-heap"))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(feature = "dhat-heap"))]
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
+fn collect_thread_heap(force: bool) {
+    #[cfg(not(feature = "dhat-heap"))]
+    unsafe {
+        mi_collect(force);
+    }
+    #[cfg(feature = "dhat-heap")]
+    let _ = force;
+}
+
 /// Report allocator counters for the phase just finished (no-op without
 /// `--features alloc-stats`).
 macro_rules! alloc_report {
@@ -56,10 +70,15 @@ mod alloc_stats {
             let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
             PEAK.fetch_max(live, Relaxed);
             PEAK_SINCE.fetch_max(live, Relaxed);
-            unsafe { self.0.alloc(layout) }
+            let ptr = unsafe { self.0.alloc(layout) };
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::allocated(ptr, layout.size(), live);
+            ptr
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             LIVE.fetch_sub(layout.size(), Relaxed);
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::freed(ptr);
             unsafe { self.0.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -69,7 +88,12 @@ mod alloc_stats {
             let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
             PEAK.fetch_max(live, Relaxed);
             PEAK_SINCE.fetch_max(live, Relaxed);
-            unsafe { self.0.realloc(ptr, layout, new_size) }
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::freed(ptr);
+            let ptr = unsafe { self.0.realloc(ptr, layout, new_size) };
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::allocated(ptr, new_size, live);
+            ptr
         }
     }
 
@@ -90,6 +114,9 @@ mod alloc_stats {
 #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::Counting = alloc_stats::Counting(MiMalloc);
+
+#[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+mod alloc_sample;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -548,6 +575,8 @@ fn load_env_file_beside_exe() {
 /// thread, so each one, like the thread driving the runtime, gets
 /// [`glua_code_analysis::ANALYSIS_STACK_SIZE`], as in the server.
 fn main() {
+    #[cfg(not(feature = "dhat-heap"))]
+    glua_code_analysis::set_analysis_heap_collector(|| collect_thread_heap(true));
     load_env_file_beside_exe();
     std::thread::Builder::new()
         .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
@@ -570,6 +599,8 @@ async fn run() {
     let mut alloc_mark = (0u64, 0u64);
     #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
     alloc_stats::lend_to_profile();
+    #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+    alloc_sample::init();
     setup_logger();
 
     let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
@@ -779,6 +810,10 @@ async fn run() {
     let indexing_duration = t.elapsed();
     glua_code_analysis::profile::work::report("index");
     glua_code_analysis::profile::memory::checkpoint("after indexing");
+    glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+    glua_code_analysis::profile::memory::checkpoint("after collecting");
+    #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+    alloc_sample::dump("indexed");
     alloc_report!("indexing", alloc_mark);
     // `BENCH_MEM_PARTS=1` (with `--features alloc-stats`) drops the indexed analysis
     // part by part and prints the live bytes each part held, then exits.
@@ -798,6 +833,8 @@ async fn run() {
             "[mem part] live after everything {:.1} MiB",
             mib(alloc_stats::LIVE.load(Relaxed) as isize)
         );
+        #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+        alloc_sample::dump("after_drop");
         std::process::exit(0);
     }
     results.push(BenchmarkResult {
@@ -872,6 +909,8 @@ async fn run() {
                         }
                     }
                 }
+                glua_code_analysis::release_thread_caches();
+                collect_thread_heap(true);
             });
         }
     });
@@ -882,11 +921,22 @@ async fn run() {
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
     glua_code_analysis::profile::work::report("diagnostics");
+    glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
     glua_code_analysis::profile::memory::checkpoint("after diagnostics");
     if glua_code_analysis::profile::profiling() {
         eprintln!("[mem] {}", analysis.compilation.memory_census());
     }
     alloc_report!("diagnostics", alloc_mark);
+    {
+        let db = analysis.compilation.get_db_mut();
+        let evicted = db.get_vfs_mut().evict_cold_trees(|_| false);
+        db.release_fingerprint_cache();
+        if !evicted.is_empty() {
+            drop(evicted);
+            glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+        }
+        glua_code_analysis::profile::memory::checkpoint("after evicting cold vfs");
+    }
     results.push(BenchmarkResult {
         phase: format!(
             "diagnostics ({} files, {} issues)",

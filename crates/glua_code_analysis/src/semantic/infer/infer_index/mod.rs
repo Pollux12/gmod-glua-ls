@@ -883,7 +883,7 @@ fn exact_member_type(
     let item = match member_ids.as_slice() {
         [] => return None,
         [member_id] => LuaMemberIndexItem::One(*member_id),
-        _ => LuaMemberIndexItem::Many(member_ids),
+        _ => LuaMemberIndexItem::Many(member_ids.into_boxed_slice()),
     };
     Some(item.resolve_type(db))
 }
@@ -1396,7 +1396,7 @@ fn infer_table_metatable_member(
         .ok_or(InferFailReason::FieldNotFound)?;
 
     let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
-    let index_member_key = LuaMemberKey::Name("__index".into());
+    let index_member_key = LuaMemberKey::name("__index");
     // Writers that disagree (one table here, another there) are looked up
     // through each of them, the way the runtime reads whichever one is set.
     match infer_owner_raw_member_type_with_realm_cached(
@@ -2534,7 +2534,7 @@ fn infer_custom_type_member(
         if !visible_member_ids.is_empty() {
             let visible_item = match visible_member_ids.as_slice() {
                 [member_id] => LuaMemberIndexItem::One(*member_id),
-                _ => LuaMemberIndexItem::Many(visible_member_ids),
+                _ => LuaMemberIndexItem::Many(visible_member_ids.into_boxed_slice()),
             };
             return visible_item.resolve_type(db);
         }
@@ -2589,7 +2589,7 @@ fn infer_custom_type_member(
     if !local_class_member_ids.is_empty() {
         let member_item = match local_class_member_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),
-            _ => LuaMemberIndexItem::Many(local_class_member_ids.as_ref().clone()),
+            _ => LuaMemberIndexItem::Many(local_class_member_ids.as_slice().into()),
         };
         let visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
             db,
@@ -2599,7 +2599,7 @@ fn infer_custom_type_member(
         if !visible_member_ids.is_empty() {
             let visible_item = match visible_member_ids.as_slice() {
                 [member_id] => LuaMemberIndexItem::One(*member_id),
-                _ => LuaMemberIndexItem::Many(visible_member_ids),
+                _ => LuaMemberIndexItem::Many(visible_member_ids.into_boxed_slice()),
             };
             return visible_item.resolve_type(db);
         }
@@ -2806,7 +2806,10 @@ fn get_expr_key_members(
     key: &LuaMemberKey,
     owner: &LuaMemberOwner,
 ) -> Option<LuaType> {
-    let LuaMemberKey::ExprType(LuaType::Ref(index_id)) = key else {
+    let LuaMemberKey::ExprType(typ) = key else {
+        return None;
+    };
+    let LuaType::Ref(index_id) = typ.as_ref() else {
         return None;
     };
     let index_type_decl = db.get_type_index().get_type_decl(index_id)?;
@@ -2921,7 +2924,7 @@ fn infer_tuple_member(
                 None => Err(InferFailReason::FieldNotFound),
             };
         }
-        LuaMemberKey::ExprType(expr_type) => match expr_type {
+        LuaMemberKey::ExprType(expr_type) => match expr_type.as_ref() {
             LuaType::IntegerConst(i) => {
                 let index = if *i > 0 { *i - 1 } else { 0 };
                 return match tuple_type.get_type(index as usize) {
@@ -3476,7 +3479,7 @@ fn infer_global_path_member(
     let visible_item = match visible_member_ids.as_slice() {
         [] => return Err(InferFailReason::FieldNotFound),
         [member_id] => LuaMemberIndexItem::One(*member_id),
-        _ => LuaMemberIndexItem::Many(visible_member_ids),
+        _ => LuaMemberIndexItem::Many(visible_member_ids.into_boxed_slice()),
     };
     let resolved = visible_item.resolve_type(db);
     let decl_backed_type = resolve_decl_backed_global_path_member_type(
@@ -3725,7 +3728,7 @@ fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
 fn dynamic_numeric_index_key(key: &LuaMemberKey) -> bool {
     matches!(
         key,
-        LuaMemberKey::ExprType(LuaType::Integer | LuaType::Number)
+        LuaMemberKey::ExprType(typ) if matches!(typ.as_ref(), LuaType::Integer | LuaType::Number)
     )
 }
 
@@ -4181,7 +4184,7 @@ fn get_expr_member_key(
         }
         match &current_type {
             LuaType::StringConst(name) | LuaType::DocStringConst(name) => {
-                keys.insert(LuaMemberKey::Name((**name).clone()));
+                keys.insert(LuaMemberKey::Name(name.clone()));
             }
             LuaType::IntegerConst(i) | LuaType::DocIntegerConst(i) => {
                 keys.insert(LuaMemberKey::Integer(*i));
@@ -4211,7 +4214,7 @@ fn get_expr_member_key(
                 }
             }
             LuaType::TableConst(_) | LuaType::Tuple(_) => {
-                keys.insert(LuaMemberKey::ExprType(current_type.clone()));
+                keys.insert(LuaMemberKey::ExprType(Box::new(current_type.clone())));
             }
             LuaType::Ref(id) => {
                 if let Some(type_decl) = db.get_type_index().get_type_decl(id) {
@@ -4224,7 +4227,7 @@ fn get_expr_member_key(
                         }
                     }
                     if type_decl.is_enum() || type_decl.is_alias() {
-                        keys.insert(LuaMemberKey::ExprType(current_type.clone()));
+                        keys.insert(LuaMemberKey::ExprType(Box::new(current_type.clone())));
                     }
                 }
             }

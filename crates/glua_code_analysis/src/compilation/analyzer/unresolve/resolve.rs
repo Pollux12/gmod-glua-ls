@@ -1765,7 +1765,7 @@ fn collect_signature_special_call_params(
     signature_id: LuaSignatureId,
 ) -> Vec<SpecialCallParamInfo> {
     let mut param_infos = Vec::new();
-    for (idx, param_info) in &signature.param_docs {
+    for (idx, param_info) in signature.param_docs.iter() {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
         let is_base_class = param_info
             .get_attribute_by_name(BASE_CLASS_ATTRIBUTE)
@@ -1989,7 +1989,7 @@ fn resolve_out_param_target_from_member_lookup(
 ) -> Result<Option<ResolvedOutParamTarget>, InferFailReason> {
     let expr_type = infer_expr(db, cache, expr)?;
     let Some(member_infos) =
-        find_members_with_key(db, &expr_type, LuaMemberKey::Name(field_name.into()), true)
+        find_members_with_key(db, &expr_type, LuaMemberKey::name(field_name), true)
     else {
         return Ok(None);
     };
@@ -2512,7 +2512,7 @@ fn try_resolve_constructor_param(
     }
 
     let target_type = LuaType::Ref(target_id);
-    let member_key = LuaMemberKey::Name(target_signature_name);
+    let member_key = LuaMemberKey::name(target_signature_name);
     let members = db
         .get_module_index()
         .get_workspace_id(file_id)

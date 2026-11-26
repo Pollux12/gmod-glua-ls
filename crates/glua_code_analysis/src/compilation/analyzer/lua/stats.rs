@@ -2778,7 +2778,7 @@ mod tests {
                     .map(|decl| decl.get_id())
             })
             .expect("the local");
-        let slot = FactKey::TypeCache(crate::LuaTypeOwner::Decl(decl_id));
+        let slot = FactKey::type_cache(&crate::LuaTypeOwner::Decl(decl_id));
         let producing = root
             .descendants::<glua_parser::LuaAssignStat>()
             .map(|assign| {
@@ -2787,9 +2787,7 @@ mod tests {
                     file_id,
                     LuaSyntaxId::from_node(assign.syntax()),
                 );
-                db.reader_graph()
-                    .outputs_of(id)
-                    .any(|key| key.key() == &slot)
+                db.reader_graph().outputs_of(id).any(|key| key == &slot)
             })
             .collect::<Vec<_>>();
 
@@ -2920,7 +2918,7 @@ mod tests {
                     record_pending_dynamic_key_collection_widening(
                         analyzer,
                         owner.clone(),
-                        LuaMemberKey::ExprType(LuaType::String),
+                        LuaMemberKey::ExprType(Box::new(LuaType::String)),
                         additional_base,
                     );
                 }

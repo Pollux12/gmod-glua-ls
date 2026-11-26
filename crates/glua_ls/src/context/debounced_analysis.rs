@@ -756,6 +756,7 @@ impl DebouncedAnalysis {
         tokio::select! {
             _ = self.shutdown.cancelled() => false,
             result = tokio::task::spawn_blocking(move || {
+                let _caches = crate::util::ClearThreadCachesOnDrop::with_heap_sweep();
                 let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
                 let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
@@ -798,6 +799,7 @@ impl DebouncedAnalysis {
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
+                let _caches = crate::util::ClearThreadCachesOnDrop::with_heap_sweep();
                 let wait_start = crate::util::ls_profile::profile_instant();
                 let mut guard = analysis.blocking_write();
                 let hold_start = crate::util::ls_profile::profile_instant();
@@ -964,6 +966,7 @@ impl DebouncedAnalysis {
     async fn begin_rebuild(&self, files: Option<Vec<FileId>>) -> bool {
         let analysis = self.analysis.clone();
         let rebuild = tokio::task::spawn_blocking(move || {
+            let _caches = crate::util::ClearThreadCachesOnDrop::with_heap_sweep();
             let mut guard = analysis.blocking_write();
             match files {
                 Some(files) => {
@@ -1183,6 +1186,7 @@ impl DebouncedAnalysis {
                         self.refresh_views();
                     }
                     self.refresh_dirty_state().await;
+                    crate::util::spawn_release_free_memory();
                 }
                 // A didChange applied its text; its schedule pre-empts.
                 UpdateProgress::TextChanged => text_changed = true,

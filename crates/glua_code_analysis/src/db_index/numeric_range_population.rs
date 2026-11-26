@@ -3,8 +3,6 @@ use std::sync::Arc;
 use crate::db_index::cow_shards::CowShards;
 use rowan::{TextRange, TextSize};
 
-use smol_str::SmolStr;
-
 use crate::{
     FileId, LuaType,
     db_index::derivation::{self, FactKey, Fingerprint},
@@ -51,7 +49,7 @@ impl NumericRangePopulationIndex {
         self.remove(file_id);
         for population in &populations {
             derivation::note_write(|| {
-                FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+                FactKey::NumericPopulation(population.table_global.as_str().into())
             });
             let entries = self
                 .by_global
@@ -66,7 +64,7 @@ impl NumericRangePopulationIndex {
     }
 
     pub fn get_for_global(&self, table_global: &str) -> &[TableNumericRangePopulation] {
-        derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+        derivation::note_read(|| FactKey::NumericPopulation(table_global.into()));
         self.by_global
             .get(table_global)
             .map(Vec::as_slice)
@@ -74,7 +72,7 @@ impl NumericRangePopulationIndex {
     }
 
     pub fn has_global(&self, table_global: &str) -> bool {
-        derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+        derivation::note_read(|| FactKey::NumericPopulation(table_global.into()));
         self.by_global.contains_key(table_global)
     }
 
@@ -84,7 +82,7 @@ impl NumericRangePopulationIndex {
         self.by_file.iter().inspect(|(_, populations)| {
             for population in populations.iter() {
                 derivation::note_read(|| {
-                    FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+                    FactKey::NumericPopulation(population.table_global.as_str().into())
                 });
             }
         })
@@ -94,7 +92,7 @@ impl NumericRangePopulationIndex {
         &self,
     ) -> impl Iterator<Item = (&String, &Vec<TableNumericRangePopulation>)> {
         self.by_global.iter().inspect(|(table_global, _)| {
-            derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+            derivation::note_read(|| FactKey::NumericPopulation((*table_global).as_str().into()));
         })
     }
 
@@ -114,7 +112,7 @@ impl NumericRangePopulationIndex {
         if let Some(populations) = self.by_file.remove(&file_id) {
             for population in populations {
                 derivation::note_write(|| {
-                    FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+                    FactKey::NumericPopulation(population.table_global.as_str().into())
                 });
                 if let Some(entries) = self.by_global.get_mut(&population.table_global) {
                     entries.retain(|entry| entry.file_id != file_id);
@@ -129,7 +127,7 @@ impl NumericRangePopulationIndex {
     pub fn clear(&mut self) {
         if derivation::recording() {
             for table_global in self.by_global.keys() {
-                derivation::note_write(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+                derivation::note_write(|| FactKey::NumericPopulation(table_global.as_str().into()));
             }
         }
         self.by_file.clear();

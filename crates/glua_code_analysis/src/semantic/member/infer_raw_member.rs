@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use rowan::TextSize;
-use smol_str::SmolStr;
 
 use crate::{
     CallerSite, DbIndex, FileId, GmodRealm, InFiled, InferFailReason, InferGuard, InferGuardRef,
@@ -79,7 +78,7 @@ fn infer_raw_member_type_guard(
                     LuaMemberKey::ExprType(t) => {
                         t.is_integer()
                             || t.is_number()
-                            || matches!(t, LuaType::Number | LuaType::Integer)
+                            || matches!(t.as_ref(), LuaType::Number | LuaType::Integer)
                     }
                     _ => false,
                 };
@@ -482,7 +481,7 @@ fn resolve_member_item_at(
         }
         let item = match surviving_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),
-            _ => LuaMemberIndexItem::Many(surviving_ids),
+            _ => LuaMemberIndexItem::Many(surviving_ids.into_boxed_slice()),
         };
         return if let Some(site) = site {
             let visible_ids = item.visible_member_ids_at_site(db, site);
@@ -495,7 +494,7 @@ fn resolve_member_item_at(
             }
             let visible_item = match visible_ids.as_slice() {
                 [member_id] => LuaMemberIndexItem::One(*member_id),
-                _ => LuaMemberIndexItem::Many(visible_ids),
+                _ => LuaMemberIndexItem::Many(visible_ids.into_boxed_slice()),
             };
             visible_item.resolve_type(db)
         } else {
@@ -574,7 +573,7 @@ fn infer_custom_type_raw_member_type(
     if !local_class_member_ids.is_empty() {
         let member_item = match local_class_member_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),
-            _ => LuaMemberIndexItem::Many(local_class_member_ids.as_ref().clone()),
+            _ => LuaMemberIndexItem::Many(local_class_member_ids.as_slice().into()),
         };
         return member_item.resolve_type(db);
     }
@@ -633,9 +632,9 @@ fn infer_object_raw_member_type(
     let index_accesses = object.get_index_access();
     for (key, value) in index_accesses {
         let access_key_type = match &member_key {
-            LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
+            LuaMemberKey::Name(name) => LuaType::StringConst(name.clone()),
             LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-            LuaMemberKey::ExprType(lua_type) => lua_type.clone(),
+            LuaMemberKey::ExprType(lua_type) => lua_type.as_ref().clone(),
             LuaMemberKey::None => continue,
         };
 
@@ -689,8 +688,8 @@ fn infer_table_generic_raw_member_type(
     let value_type = &table_params[1];
     let access_key_type = match member_key {
         LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-        LuaMemberKey::Name(name) => LuaType::StringConst(SmolStr::new(name.as_str()).into()),
-        LuaMemberKey::ExprType(expr_type) => expr_type.clone(),
+        LuaMemberKey::Name(name) => LuaType::StringConst(name.clone()),
+        LuaMemberKey::ExprType(expr_type) => expr_type.as_ref().clone(),
         LuaMemberKey::None => return Err(InferFailReason::FieldNotFound),
     };
     if check_type_compact(db, key_type, &access_key_type).is_ok() {

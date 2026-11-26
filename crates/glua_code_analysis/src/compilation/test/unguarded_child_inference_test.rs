@@ -1421,7 +1421,7 @@ mod test {
                 ws.analysis.compilation.get_db(),
                 &mut cache,
                 &crate::LuaType::Ref(player_id.clone()),
-                &crate::LuaMemberKey::Name("IsKiller".into()),
+                &crate::LuaMemberKey::name("IsKiller"),
                 None,
             )
             .is_ok_and(|resolution| resolution.is_some()),
@@ -4156,7 +4156,7 @@ filter:SetUpdateOnType(true)
             .find(|index| index.syntax().text() == "ent.Boost")
             .unwrap();
         let class = crate::LuaTypeDeclId::global("ReadCar");
-        let key = crate::LuaMemberKey::Name("Boost".into());
+        let key = crate::LuaMemberKey::name("Boost");
         let mut cache = model.get_cache().borrow_mut();
         assert!(
             crate::semantic::resolve_dynamic_field_member(

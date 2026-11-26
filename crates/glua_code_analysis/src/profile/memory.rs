@@ -54,7 +54,33 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static PEAK_PRIVATE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn process_memory() -> Option<super::ProcessMemory> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                .and_then(|rest| rest.trim().strip_suffix("kB")?.trim().parse::<usize>().ok())
+                .map(|kilobytes| kilobytes * 1024)
+        };
+        let working_set = field("VmRSS")?;
+        let private = field("RssAnon").unwrap_or(working_set);
+        Some(super::ProcessMemory {
+            working_set,
+            private,
+            peak_working_set: field("VmHWM").unwrap_or(working_set),
+            peak_private: PEAK_PRIVATE.fetch_max(private, Relaxed).max(private),
+        })
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     pub(super) fn process_memory() -> Option<super::ProcessMemory> {
         None

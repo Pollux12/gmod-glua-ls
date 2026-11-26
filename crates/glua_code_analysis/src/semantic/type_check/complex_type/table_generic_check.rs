@@ -142,7 +142,7 @@ fn check_table_generic_compact_member_owner(
         let key = member.get_key();
         let key_type = match key {
             LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
+            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone()),
             _ => LuaType::Any,
         };
 

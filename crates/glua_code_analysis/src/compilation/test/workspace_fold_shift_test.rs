@@ -96,7 +96,7 @@ mod test {
             .filter(|id| {
                 graph
                     .reads_of(*id)
-                    .any(|key| matches!(key.key(), FactKey::Syntax(_)))
+                    .any(|key| matches!(key, FactKey::Syntax(_)))
             })
             .map(|id| id.kind)
             .collect()

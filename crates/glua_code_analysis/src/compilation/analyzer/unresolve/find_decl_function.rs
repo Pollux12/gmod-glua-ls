@@ -591,7 +591,7 @@ fn find_member_by_index_table(
                     let mut result_type = LuaType::Never;
                     for member in members {
                         let member_key_type = match member.get_key() {
-                            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
+                            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone()),
                             LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
                             _ => continue,
                         };

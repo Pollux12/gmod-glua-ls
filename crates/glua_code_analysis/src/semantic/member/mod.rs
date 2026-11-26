@@ -325,7 +325,7 @@ mod tests {
         let file_id = ws.def_file("lua/autorun/shared/order.lua", CONTENT);
         let db = ws.analysis.compilation.get_db();
         let owner = table_owner(file_id, CONTENT);
-        let key = LuaMemberKey::Name("x".into());
+        let key = LuaMemberKey::name("x");
         let before = TextSize::from(CONTENT.find("t.x").expect("the read before") as u32);
         let after = TextSize::from(CONTENT.rfind("t.x").expect("the read after") as u32);
         let read = |cache: &mut LuaInferCache, position| {
@@ -369,7 +369,7 @@ mod tests {
         let caller = ws.def_file("lua/autorun/shared/use.lua", CALLER);
         let db = ws.analysis.compilation.get_db();
         let owner = table_owner(library, LIBRARY);
-        let key = LuaMemberKey::Name("size".into());
+        let key = LuaMemberKey::name("size");
         let mut cache = LuaInferCache::new(caller, Default::default());
 
         let reads = [CALLER.find("Config"), CALLER.rfind("Config")].map(|offset| {
@@ -404,7 +404,7 @@ mod tests {
         );
         ws.def_file("lua/autorun/shared/a.lua", "Shared = 1");
         let db = ws.analysis.compilation.get_db();
-        let key = LuaMemberKey::Name("Shared".into());
+        let key = LuaMemberKey::name("Shared");
 
         let scanned = crate::find_members(db, &LuaType::Global)
             .expect("globals are found")
@@ -431,7 +431,7 @@ mod tests {
             LuaType::String,
             LuaType::Boolean,
         ];
-        let keys = [LuaMemberKey::Integer(3), LuaMemberKey::Name("name".into())];
+        let keys = [LuaMemberKey::Integer(3), LuaMemberKey::name("name")];
         for access in &accesses {
             for key in &keys {
                 let key_type = member_key_as_type(key).expect("a literal key has a type");
@@ -452,18 +452,18 @@ mod tests {
         let text = |value: &str| LuaType::DocStringConst(smol_str::SmolStr::new(value).into());
         let access = LuaType::from_vec(vec![text("a"), text("b")]);
         for (key, expected) in [
-            (LuaMemberKey::Name("a".into()), true),
-            (LuaMemberKey::Name("b".into()), true),
-            (LuaMemberKey::Name("callback".into()), false),
+            (LuaMemberKey::name("a"), true),
+            (LuaMemberKey::name("b"), true),
+            (LuaMemberKey::name("callback"), false),
             (LuaMemberKey::Integer(1), false),
-            (LuaMemberKey::ExprType(LuaType::String), true),
-            (LuaMemberKey::ExprType(LuaType::Table), false),
+            (LuaMemberKey::ExprType(Box::new(LuaType::String)), true),
+            (LuaMemberKey::ExprType(Box::new(LuaType::Table)), false),
             (
-                LuaMemberKey::ExprType(LuaType::from_vec(vec![text("b"), text("c")])),
+                LuaMemberKey::ExprType(Box::new(LuaType::from_vec(vec![text("b"), text("c")]))),
                 true,
             ),
             (
-                LuaMemberKey::ExprType(LuaType::from_vec(vec![text("c"), text("d")])),
+                LuaMemberKey::ExprType(Box::new(LuaType::from_vec(vec![text("c"), text("d")]))),
                 false,
             ),
         ] {
@@ -490,9 +490,9 @@ mod tests {
     #[test]
     fn typed_keys_preserve_domains_and_unknown_key_fallbacks() {
         let db = DbIndex::new();
-        let numeric = LuaMemberKey::ExprType(LuaType::Integer);
-        let table = LuaMemberKey::ExprType(LuaType::Table);
-        let unknown = LuaMemberKey::ExprType(LuaType::Unknown);
+        let numeric = LuaMemberKey::ExprType(Box::new(LuaType::Integer));
+        let table = LuaMemberKey::ExprType(Box::new(LuaType::Table));
+        let unknown = LuaMemberKey::ExprType(Box::new(LuaType::Unknown));
         assert!(member_key_matches_type(&db, &LuaType::Integer, &numeric));
         assert!(!member_key_matches_type(&db, &LuaType::Integer, &table));
         assert!(member_key_matches_type(&db, &LuaType::Table, &table));
@@ -516,7 +516,7 @@ mod tests {
         let table_of = LuaType::TableOf(Box::new(LuaType::Ref(LuaTypeDeclId::global("Entity"))));
 
         let mut fields = BTreeMap::new();
-        fields.insert(LuaMemberKey::Name("flags".into()), LuaType::Table);
+        fields.insert(LuaMemberKey::name("flags"), LuaType::Table);
         let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
 
         let merged = merge_open_table_types(&db, vec![table_of.clone(), object.clone()]);
@@ -531,10 +531,10 @@ mod tests {
     fn merge_open_table_types_keeps_mixed_union_alternatives_distinct() {
         let db = DbIndex::new();
         let mut left_fields = BTreeMap::new();
-        left_fields.insert(LuaMemberKey::Name("left".into()), LuaType::Integer);
+        left_fields.insert(LuaMemberKey::name("left"), LuaType::Integer);
         let left = LuaType::Object(LuaObjectType::new_with_fields(left_fields, Vec::new()).into());
         let mut right_fields = BTreeMap::new();
-        right_fields.insert(LuaMemberKey::Name("right".into()), LuaType::String);
+        right_fields.insert(LuaMemberKey::name("right"), LuaType::String);
         let right =
             LuaType::Object(LuaObjectType::new_with_fields(right_fields, Vec::new()).into());
         let mixed = LuaType::from_vec_structural(vec![left, right, LuaType::BooleanConst(false)]);
@@ -559,7 +559,7 @@ mod tests {
         "#;
         let path = "lua/autorun/shared/bound.lua";
         let bound = LuaTypeDeclId::global("BoundClass");
-        let speed = LuaMemberKey::Name("speed".into());
+        let speed = LuaMemberKey::name("speed");
         let mut ws = VirtualWorkspace::new();
         let uri = ws.virtual_url_generator.new_uri(path);
         ws.def_file(path, BOUND);
@@ -622,7 +622,7 @@ mod tests {
             "#,
         );
         let preset = LuaTypeDeclId::global("RadioPreset");
-        let volume = LuaMemberKey::Name("volume".into());
+        let volume = LuaMemberKey::name("volume");
         assert_eq!(
             local_class_table_member_ids(ws.analysis.compilation.get_db(), &preset, &volume).len(),
             1
@@ -710,7 +710,7 @@ mod tests {
             .expect("initial file indexed");
         let bound = LuaTypeDeclId::global("BoundClass");
         let other = LuaTypeDeclId::global("OtherClass");
-        let speed = LuaMemberKey::Name("speed".into());
+        let speed = LuaMemberKey::name("speed");
         let db = ws.analysis.compilation.get_db();
         assert_eq!(
             local_class_table_member_ids(db, &bound, &speed).len(),
@@ -770,7 +770,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file("lua/autorun/shared/sorted.lua", CONTENT);
         let type_id = LuaTypeDeclId::global("SortedClass");
-        let key = LuaMemberKey::Name("speed".into());
+        let key = LuaMemberKey::name("speed");
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         let db = ws.analysis.compilation.get_db();
@@ -809,7 +809,7 @@ mod tests {
         let path = "lua/autorun/shared/growing.lua";
         let file_id = ws.def_file(path, EMPTY);
         let type_id = LuaTypeDeclId::global("GrowingClass");
-        let key = LuaMemberKey::Name("speed".into());
+        let key = LuaMemberKey::name("speed");
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
@@ -855,8 +855,8 @@ mod tests {
         let path = "lua/autorun/shared/rekey.lua";
         let file_id = ws.def_file(path, SPEED);
         let type_id = LuaTypeDeclId::global("RekeyClass");
-        let speed = LuaMemberKey::Name("speed".into());
-        let velocity = LuaMemberKey::Name("velocity".into());
+        let speed = LuaMemberKey::name("speed");
+        let velocity = LuaMemberKey::name("velocity");
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &speed);
@@ -921,7 +921,7 @@ mod tests {
         let file_a = ws.def_file(path_a, FILE_A);
         ws.def_file(path_b, FILE_B);
         let type_id = LuaTypeDeclId::global("MultiClass");
-        let key = LuaMemberKey::Name("speed".into());
+        let key = LuaMemberKey::name("speed");
         let mut cache = LuaInferCache::new(file_a, Default::default());
 
         let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
@@ -966,7 +966,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file("lua/autorun/shared/filtered.lua", CONTENT);
         let type_id = LuaTypeDeclId::global("FilteredClass");
-        let wanted = LuaMemberKey::Name("wanted".into());
+        let wanted = LuaMemberKey::name("wanted");
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &wanted);
@@ -997,7 +997,7 @@ mod tests {
         let file_id = ws.def_file(path, BOUND);
         let bound = LuaTypeDeclId::global("CachedBound");
         let other = LuaTypeDeclId::global("CachedOther");
-        let speed = LuaMemberKey::Name("speed".into());
+        let speed = LuaMemberKey::name("speed");
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         let found = assert_cached_matches_uncached(&ws, &mut cache, &bound, &speed);
@@ -1729,8 +1729,8 @@ pub(crate) fn member_key_as_type(key: &LuaMemberKey) -> Option<LuaType> {
     match key {
         LuaMemberKey::None => None,
         LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
-        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
-        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone())),
+        LuaMemberKey::ExprType(typ) => Some(typ.as_ref().clone()),
     }
 }
 
@@ -1819,7 +1819,7 @@ impl<'a> AccessKeyMatcher<'a> {
 fn literal_type_member_key(typ: &LuaType) -> Option<LuaMemberKey> {
     match typ {
         LuaType::StringConst(name) | LuaType::DocStringConst(name) => {
-            Some(LuaMemberKey::Name((**name).clone()))
+            Some(LuaMemberKey::Name(name.clone()))
         }
         LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => {
             Some(LuaMemberKey::Integer(*value))
