@@ -104,7 +104,8 @@ impl LuaDeclIndex {
         removed
     }
 
-    pub fn add_decl_tree(&mut self, tree: LuaDeclarationTree) {
+    pub fn add_decl_tree(&mut self, mut tree: LuaDeclarationTree) {
+        tree.shrink_to_fit();
         let file_id = tree.file_id();
         note_tree_write(file_id, &tree);
         if let Some(old) = self.decl_trees.insert(file_id, tree) {

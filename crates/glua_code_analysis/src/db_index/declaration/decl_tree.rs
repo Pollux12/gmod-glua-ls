@@ -1,5 +1,8 @@
-use rustc_hash::FxHashMap;
+use hashbrown::HashTable;
+use internment::ArcIntern;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 use std::sync::OnceLock;
 
 use super::{LuaDeclId, decl, scope};
@@ -10,6 +13,58 @@ use rowan::{TextRange, TextSize};
 use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 use smol_str::SmolStr;
 
+type InterestingEntry = ((TextSize, u32), InterestingChild);
+
+/// Inline single-entry fast path for scope child lists: the vast majority of
+/// `(scope, name)` buckets hold exactly one declaration or statement scope.
+#[derive(Debug, Clone)]
+enum InterestingEntries {
+    One(InterestingEntry),
+    Many(Box<Vec<InterestingEntry>>),
+}
+
+impl InterestingEntries {
+    fn as_slice(&self) -> &[InterestingEntry] {
+        match self {
+            Self::One(entry) => std::slice::from_ref(entry),
+            Self::Many(entries) => entries.as_slice(),
+        }
+    }
+
+    fn insert(&mut self, key: (TextSize, u32), child: InterestingChild) {
+        match self {
+            Self::One(existing) => {
+                if existing.0 == key && matches!(child, InterestingChild::Scope(_)) {
+                    return;
+                }
+                let first = *existing;
+                let pair = if key < first.0 {
+                    vec![(key, child), first]
+                } else {
+                    vec![first, (key, child)]
+                };
+                *self = Self::Many(Box::new(pair));
+            }
+            Self::Many(entries) => match entries.binary_search_by_key(&key, |(key, _)| *key) {
+                Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
+                Ok(at) | Err(at) => entries.insert(at, (key, child)),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NamedInterestingBucket {
+    scope_id: u32,
+    name: ArcIntern<SmolStr>,
+    entries: InterestingEntries,
+}
+
+#[inline]
+fn named_bucket_hash(scope_id: u32, name: &str) -> u64 {
+    FxBuildHasher.hash_one((scope_id, name))
+}
+
 #[derive(Debug, Clone)]
 pub struct LuaDeclarationTree {
     file_id: FileId,
@@ -18,18 +73,13 @@ pub struct LuaDeclarationTree {
     scopes: Vec<LuaScope>,
     /// Each scope's index in its parent's `children`, parallel to `scopes`.
     scope_child_index: Vec<u32>,
-    /// Per scope, the children `base_walk_up` would visit that can match:
-    /// direct declarations, plus child scopes with direct declarations of
-    /// their own. Sorted by `(position, child index)` — the same order they
-    /// hold in `children` — so the walk iterates newest-first by
-    /// binary-searching the `position < start` boundary instead of scanning
-    /// every statement scope. Only scopes with any hold an entry.
-    interesting_children: FxHashMap<LuaScopeId, Vec<((TextSize, u32), InterestingChild)>>,
-    /// The same ordered visit set keyed by declaration name. `find_local_decl`
-    /// only needs one name, so it can skip unrelated declarations while keeping
-    /// the source-order walk and scope boundaries intact.
-    interesting_children_by_name:
-        FxHashMap<LuaScopeId, FxHashMap<SmolStr, Vec<((TextSize, u32), InterestingChild)>>>,
+    /// Per scope (`LuaScopeId::id`), the children `base_walk_up` would visit
+    /// that can match: direct declarations, plus child scopes with direct
+    /// declarations of their own. Sorted by `(position, child index)`.
+    interesting_children: FxHashMap<u32, InterestingEntries>,
+    /// Flat per-file table mapping `(scope_id, name)` to the matching ordered
+    /// visit entries. Avoids one nested `FxHashMap` per scope.
+    interesting_children_by_name: HashTable<NamedInterestingBucket>,
     /// Content fingerprint for `FactKey::DeclTree`, computed on first use and
     /// reset by every mutation.
     fingerprint: OnceLock<Fingerprint>,
@@ -44,7 +94,7 @@ impl LuaDeclarationTree {
             scopes: Vec::new(),
             scope_child_index: Vec::new(),
             interesting_children: FxHashMap::default(),
-            interesting_children_by_name: FxHashMap::default(),
+            interesting_children_by_name: HashTable::new(),
             fingerprint: OnceLock::new(),
         }
     }
@@ -232,12 +282,18 @@ impl LuaDeclarationTree {
     ) where
         F: FnMut(ScopeOrDeclId) -> bool,
     {
+        let scope_id = scope.get_id().id;
         let interesting = match name {
             Some(name) => self
                 .interesting_children_by_name
-                .get(&scope.get_id())
-                .and_then(|children| children.get(name)),
-            None => self.interesting_children.get(&scope.get_id()),
+                .find(named_bucket_hash(scope_id, name), |bucket| {
+                    bucket.scope_id == scope_id && bucket.name.as_str() == name
+                })
+                .map(|bucket| bucket.entries.as_slice()),
+            None => self
+                .interesting_children
+                .get(&scope_id)
+                .map(InterestingEntries::as_slice),
         };
         if let Some(interesting) = interesting {
             // Sorted by `(position, child index)`, the order entries hold in
@@ -393,29 +449,31 @@ impl LuaDeclarationTree {
     pub fn add_decl_to_scope(&mut self, scope_id: LuaScopeId, decl_id: LuaDeclId) {
         self.fingerprint.take();
         derivation::note_write(|| FactKey::DeclTree(self.file_id));
-        let decl_name = self
-            .get_decl(&decl_id)
-            .map(|decl| SmolStr::new(decl.get_name()));
+        let decl_name = self.get_decl(&decl_id).map(LuaDecl::interned_name);
         let Some(scope) = self.scopes.get_mut(scope_id.id as usize) else {
             return;
         };
         let vec_index = scope.get_children().len() as u32;
         scope.add_decl(decl_id);
         let (kind, parent, position) = (scope.get_kind(), scope.get_parent(), scope.get_position());
-        insert_interesting_child(
-            &mut self.interesting_children,
-            scope_id,
-            (decl_id.position, vec_index),
-            InterestingChild::Decl(decl_id),
-        );
-        if let Some(name) = decl_name.as_deref() {
-            insert_named_interesting_child(
-                &mut self.interesting_children_by_name,
-                scope_id,
-                name,
+        // `walk_up` always redirects `LocalOrAssignStat` directly to its parent,
+        // so `base_walk_up` is never called on it.
+        if kind != LuaScopeKind::LocalOrAssignStat {
+            insert_interesting_child(
+                &mut self.interesting_children,
+                scope_id.id,
                 (decl_id.position, vec_index),
                 InterestingChild::Decl(decl_id),
             );
+            if let Some(name) = decl_name.as_ref() {
+                insert_named_interesting_child(
+                    &mut self.interesting_children_by_name,
+                    scope_id.id,
+                    name,
+                    (decl_id.position, vec_index),
+                    InterestingChild::Decl(decl_id),
+                );
+            }
         }
         // A child scope with direct declarations is visited for them when the
         // walk passes its parent; record it there. The key makes repeat
@@ -434,14 +492,14 @@ impl LuaDeclarationTree {
             );
             insert_interesting_child(
                 &mut self.interesting_children,
-                parent_id,
+                parent_id.id,
                 scope_key,
                 InterestingChild::Scope(scope_id),
             );
-            if let Some(name) = decl_name.as_deref() {
+            if let Some(name) = decl_name.as_ref() {
                 insert_named_interesting_child(
                     &mut self.interesting_children_by_name,
-                    parent_id,
+                    parent_id.id,
                     name,
                     scope_key,
                     InterestingChild::Scope(scope_id),
@@ -490,9 +548,9 @@ impl LuaDeclarationTree {
                         .get_children()
                         .iter()
                         .filter_map(|entry| match entry {
-                            ScopeOrDeclId::Decl(decl_id) => self
-                                .get_decl(decl_id)
-                                .map(|decl| SmolStr::new(decl.get_name())),
+                            ScopeOrDeclId::Decl(decl_id) => {
+                                self.get_decl(decl_id).map(LuaDecl::interned_name)
+                            }
                             ScopeOrDeclId::Scope(_) => None,
                         })
                         .collect::<Vec<_>>(),
@@ -509,15 +567,15 @@ impl LuaDeclarationTree {
         }
         insert_interesting_child(
             &mut self.interesting_children,
-            parent_id,
+            parent_id.id,
             (position, vec_index),
             InterestingChild::Scope(child_id),
         );
-        for name in names {
+        for name in &names {
             insert_named_interesting_child(
                 &mut self.interesting_children_by_name,
-                parent_id,
-                &name,
+                parent_id.id,
+                name,
                 (position, vec_index),
                 InterestingChild::Scope(child_id),
             );
@@ -534,6 +592,26 @@ impl LuaDeclarationTree {
 
     pub fn get_decls(&self) -> &FxHashMap<LuaDeclId, LuaDecl> {
         &self.decls
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.decls.shrink_to_fit();
+        self.module_decls_by_name.shrink_to_fit();
+        self.scopes.shrink_to_fit();
+        self.scope_child_index.shrink_to_fit();
+        self.interesting_children.shrink_to_fit();
+        for entries in self.interesting_children.values_mut() {
+            if let InterestingEntries::Many(vec) = entries {
+                vec.shrink_to_fit();
+            }
+        }
+        self.interesting_children_by_name
+            .shrink_to_fit(|bucket| named_bucket_hash(bucket.scope_id, bucket.name.as_str()));
+        for bucket in self.interesting_children_by_name.iter_mut() {
+            if let InterestingEntries::Many(vec) = &mut bucket.entries {
+                vec.shrink_to_fit();
+            }
+        }
     }
 }
 
@@ -557,52 +635,43 @@ enum InterestingChild {
 /// child index)` order. Scope entries deduplicate by key, so a scope files
 /// once however many declarations it gains.
 fn insert_interesting_child(
-    interesting: &mut FxHashMap<LuaScopeId, Vec<((TextSize, u32), InterestingChild)>>,
-    scope_id: LuaScopeId,
+    interesting: &mut FxHashMap<u32, InterestingEntries>,
+    scope_id: u32,
     key: (TextSize, u32),
     child: InterestingChild,
 ) {
-    let entries = interesting.entry(scope_id).or_default();
-    match entries.binary_search_by_key(&key, |(key, _)| *key) {
-        // Same key twice is the same scope filing again; declarations never
-        // share a key (their child index is unique per push).
-        Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
-        Ok(at) | Err(at) => {
-            // Most hold one entry: the first is room for one, later ones grow as usual.
-            if entries.is_empty() {
-                entries.reserve_exact(1);
-            }
-            entries.insert(at, (key, child));
+    match interesting.entry(scope_id) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(InterestingEntries::One((key, child)));
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            slot.get_mut().insert(key, child);
         }
     }
 }
 
 fn insert_named_interesting_child(
-    interesting: &mut FxHashMap<
-        LuaScopeId,
-        FxHashMap<SmolStr, Vec<((TextSize, u32), InterestingChild)>>,
-    >,
-    scope_id: LuaScopeId,
-    name: &str,
+    interesting: &mut HashTable<NamedInterestingBucket>,
+    scope_id: u32,
+    name: &ArcIntern<SmolStr>,
     key: (TextSize, u32),
     child: InterestingChild,
 ) {
-    let entries = interesting
-        .entry(scope_id)
-        .or_default()
-        .entry(SmolStr::new(name))
-        .or_default();
-    match entries.binary_search_by_key(&key, |(key, _)| *key) {
-        // Child scopes may be filed once per direct declaration; preserve one
-        // scope entry for each `(position, child index)` key.
-        Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
-        Ok(at) | Err(at) => {
-            // Most hold one entry: the first is room for one, later ones grow as usual.
-            if entries.is_empty() {
-                entries.reserve_exact(1);
-            }
-            entries.insert(at, (key, child));
-        }
+    let hash = named_bucket_hash(scope_id, name.as_str());
+    if let Some(bucket) = interesting.find_mut(hash, |bucket| {
+        bucket.scope_id == scope_id && bucket.name == *name
+    }) {
+        bucket.entries.insert(key, child);
+    } else {
+        interesting.insert_unique(
+            hash,
+            NamedInterestingBucket {
+                scope_id,
+                name: name.clone(),
+                entries: InterestingEntries::One((key, child)),
+            },
+            |bucket| named_bucket_hash(bucket.scope_id, bucket.name.as_str()),
+        );
     }
 }
 

@@ -156,13 +156,7 @@ pub(crate) fn var_ref_can_be_narrowed(
                 || root
                     .as_decl_id()
                     .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
-                    .is_some_and(|decl| {
-                        capability.has_opaque_name_target
-                            || capability
-                                .referenced_names
-                                .iter()
-                                .any(|name| name.as_str() == decl.get_name())
-                    })
+                    .is_some_and(|decl| capability.name_str_can_be_narrowed(decl.get_name()))
         }
     }
 }

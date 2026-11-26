@@ -16,6 +16,50 @@ fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerp
         .fold(0, u64::wrapping_add)
 }
 
+/// Compact sorted slice of interned names. Empty sets hold zero heap memory
+/// (16 bytes inline vs 48 bytes + table allocation for `FxHashSet`).
+#[derive(Debug, Clone, Default)]
+pub struct CompactNameSet(Box<[ArcIntern<SmolStr>]>);
+
+impl CompactNameSet {
+    pub fn from_vec(mut items: Vec<ArcIntern<SmolStr>>) -> Self {
+        if items.is_empty() {
+            return Self(Box::new([]));
+        }
+        items.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        items.dedup();
+        Self(items.into_boxed_slice())
+    }
+
+    pub fn from_iter(items: impl IntoIterator<Item = ArcIntern<SmolStr>>) -> Self {
+        Self::from_vec(items.into_iter().collect())
+    }
+
+    pub fn contains(&self, name: &ArcIntern<SmolStr>) -> bool {
+        if self.0.len() <= 8 {
+            self.0.iter().any(|item| item == name)
+        } else {
+            self.0
+                .binary_search_by(|item| item.as_str().cmp(name.as_str()))
+                .is_ok()
+        }
+    }
+
+    pub fn contains_str(&self, name: &str) -> bool {
+        if self.0.len() <= 8 {
+            self.0.iter().any(|item| item.as_str() == name)
+        } else {
+            self.0
+                .binary_search_by(|item| item.as_str().cmp(name))
+                .is_ok()
+        }
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ArcIntern<SmolStr>> {
+        self.0.iter()
+    }
+}
+
 /// File-wide summary of which variables/paths can possibly be narrowed by the
 /// backward flow walk. Used to skip the (expensive) walk entirely for variable
 /// references that provably reach no narrowing site — measured at ~95% of
@@ -31,10 +75,10 @@ fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerp
 pub struct FileNarrowingCapability {
     /// Names (bare identifiers) appearing in any assignment target, cast, or
     /// condition expression. Covers `VarRef`/`SelfRef`/`GlobalName` references.
-    pub referenced_names: HashSet<ArcIntern<SmolStr>>,
+    pub referenced_names: CompactNameSet,
     /// Access paths (e.g. `self.foo`, `tbl.a.b`) appearing in any assignment
     /// target, cast, or condition expression. Covers `IndexRef` references.
-    pub referenced_index_paths: HashSet<ArcIntern<SmolStr>>,
+    pub referenced_index_paths: CompactNameSet,
     /// When true, a narrowing site referenced a name/index we could not reduce
     /// to a stable key (e.g. computed index). Disables name/index skipping
     /// respectively to stay sound.
@@ -55,10 +99,29 @@ impl Hash for FileNarrowingCapability {
 }
 
 impl FileNarrowingCapability {
+    pub fn from_parts(
+        referenced_names: CompactNameSet,
+        referenced_index_paths: CompactNameSet,
+        has_opaque_name_target: bool,
+        has_opaque_index_target: bool,
+    ) -> Self {
+        Self {
+            referenced_names,
+            referenced_index_paths,
+            has_opaque_name_target,
+            has_opaque_index_target,
+        }
+    }
+
     /// Whether a bare-name reference (`VarRef`/`SelfRef`/`GlobalName`) named
     /// `name` could be narrowed somewhere in the file.
     pub fn name_can_be_narrowed(&self, name: &ArcIntern<SmolStr>) -> bool {
         self.has_opaque_name_target || self.referenced_names.contains(name)
+    }
+
+    /// Borrowed `&str` counterpart of [`Self::name_can_be_narrowed`].
+    pub fn name_str_can_be_narrowed(&self, name: &str) -> bool {
+        self.has_opaque_name_target || self.referenced_names.contains_str(name)
     }
 
     /// Whether an index reference with access `path` could be narrowed.
@@ -406,33 +469,39 @@ pub struct FlowTree {
     /// Branch labels reached only by one condition's outcomes, mapped to the
     /// node the condition is evaluated from.
     condition_label_entries: HashMap<FlowId, FlowId>,
-    assignment_flow_info: Vec<Option<Box<AssignmentFlowInfo>>>,
+    /// Sparse sorted `(FlowId, AssignmentFlowInfo)` entries (non-empty only).
+    assignment_flow_info: Box<[(FlowId, AssignmentFlowInfo)]>,
     narrowing_capability: FileNarrowingCapability,
 }
 
 impl FlowTree {
     pub fn new(
-        decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
+        mut decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
         mut flow_nodes: Vec<FlowNode>,
         multiple_antecedents: Vec<Vec<FlowId>>,
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
-        bindings: HashMap<LuaSyntaxId, FlowId>,
-        branch_label_info: HashMap<FlowId, BranchLabelInfo>,
-        condition_label_entries: HashMap<FlowId, FlowId>,
+        mut bindings: HashMap<LuaSyntaxId, FlowId>,
+        mut branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+        mut condition_label_entries: HashMap<FlowId, FlowId>,
         assignment_flow_info: Vec<AssignmentFlowInfo>,
         narrowing_capability: FileNarrowingCapability,
     ) -> Self {
+        decl_bind_expr_ref.shrink_to_fit();
         flow_nodes.shrink_to_fit();
+        bindings.shrink_to_fit();
+        branch_label_info.shrink_to_fit();
+        condition_label_entries.shrink_to_fit();
         let mut multiple_antecedents = multiple_antecedents
             .into_iter()
             .map(Vec::into_boxed_slice)
             .collect::<Vec<_>>();
         multiple_antecedents.shrink_to_fit();
-        let mut assignment_flow_info = assignment_flow_info
+        let assignment_flow_info = assignment_flow_info
             .into_iter()
-            .map(|info| (!info.is_empty()).then(|| Box::new(info)))
-            .collect::<Vec<_>>();
-        assignment_flow_info.shrink_to_fit();
+            .enumerate()
+            .filter_map(|(idx, info)| (!info.is_empty()).then_some((FlowId(idx as u32), info)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             decl_bind_expr_ref,
             flow_nodes,
@@ -504,9 +573,11 @@ impl FlowTree {
     }
 
     pub fn get_assignment_flow_info(&self, flow_id: FlowId) -> Option<&AssignmentFlowInfo> {
-        self.assignment_flow_info
-            .get(flow_id.0 as usize)?
-            .as_deref()
+        let idx = self
+            .assignment_flow_info
+            .binary_search_by_key(&flow_id.0, |(id, _)| id.0)
+            .ok()?;
+        Some(&self.assignment_flow_info[idx].1)
     }
 
     /// Whether every live path back from `flow_id` meets a node that `settle`

@@ -1798,11 +1798,7 @@ fn branch_capability_reaches_var_ref(
 }
 
 fn capability_reaches_name(capability: &crate::FileNarrowingCapability, name: &str) -> bool {
-    capability.has_opaque_name_target
-        || capability
-            .referenced_names
-            .iter()
-            .any(|narrowable_name| narrowable_name.as_str() == name)
+    capability.name_str_can_be_narrowed(name)
 }
 
 fn antecedent_has_relevant_special_call_effect(

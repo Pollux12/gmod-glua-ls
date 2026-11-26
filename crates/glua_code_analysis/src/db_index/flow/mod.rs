@@ -16,7 +16,8 @@ use crate::{
 };
 pub use flow_node::*;
 pub use flow_tree::{
-    AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, FileNarrowingCapability, FlowTree,
+    AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, CompactNameSet,
+    FileNarrowingCapability, FlowTree,
 };
 
 use super::traits::LuaIndex;
