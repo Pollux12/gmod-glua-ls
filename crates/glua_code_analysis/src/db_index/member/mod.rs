@@ -261,9 +261,10 @@ pub struct LuaMemberIndex {
     /// mutation except removal preserves the coverage an entry records, and
     /// any future history write without a paired item merge must clear its
     /// slot here. A removal that empties a slot drops its entry with the
-    /// slot ([`Self::prune_reconciled_slot`]); a re-created slot re-derives
-    /// its coverage on the next mark, so an entry never outlives the slot
-    /// it describes.
+    /// slot, wherever the slot's history entries are removed
+    /// ([`Self::prune_reconciled_slot`]); a re-created slot re-derives its
+    /// coverage on the next mark, so an entry never outlives the slot it
+    /// describes.
     preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
@@ -1700,6 +1701,11 @@ impl LuaMemberIndex {
             self.fold_history_fingerprint(owner, history_element(&key, id), false);
             note_slot_write(owner, &key);
         }
+        // This is where a member's history entries leave its slot, on every
+        // path that removes them: forgetting the member, rekeying it away
+        // from this key, and resetting its filings. The slot can empty here,
+        // so the reconciled mark goes with it.
+        self.prune_reconciled_slot(owner, &key);
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
@@ -1722,6 +1728,7 @@ impl LuaMemberIndex {
             for (owner, key, id) in &visible {
                 note_slot_write(owner, key);
                 self.fold_history_fingerprint(owner, history_element(key, *id), false);
+                self.prune_reconciled_slot(owner, key);
             }
         } else {
             let mut seen = HashSet::with_capacity_and_hasher(
@@ -1732,6 +1739,10 @@ impl LuaMemberIndex {
                 if seen.insert((owner.clone(), key.clone(), id)) {
                     note_slot_write(&owner, &key);
                     self.fold_history_fingerprint(&owner, history_element(&key, id), false);
+                    // A swept entry can be the last in its slot - one left
+                    // behind by a member that moved owners, which no
+                    // forget prunes - so the reconciled mark goes with it.
+                    self.prune_reconciled_slot(&owner, &key);
                 }
             }
         }
@@ -2924,9 +2935,9 @@ impl LuaMemberIndex {
     /// touches both sides for the same id, and marking only ever covers an
     /// already-listed member. Any future history write without a paired item
     /// merge must clear that slot's entry. A removal that empties the slot
-    /// drops its entry ([`Self::prune_reconciled_slot`]): the coverage it
-    /// recorded left with the members, and a re-created slot is marked
-    /// fresh.
+    /// drops its entry, wherever the slot's history entries are removed
+    /// ([`Self::prune_reconciled_slot`]): the coverage it recorded left with
+    /// the members, and a re-created slot is marked fresh.
     ///
     /// Exception: [`Self::set_member_owner_only`] calls `set_member_owner`
     /// without an item merge (see the `set_member_owner_only` body), filing a
@@ -3227,14 +3238,6 @@ impl LuaMemberIndex {
         } else {
             self.note_member_home_write(member_id);
         }
-        let reconciled_slot =
-            self.member_current_owner
-                .get(&member_id)
-                .cloned()
-                .and_then(|owner| {
-                    self.get_member(&member_id)
-                        .map(|member| (owner, member.get_key().clone()))
-                });
         if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
             self.remove_member_from_all_owner_key_indexes(&owner, member_id);
             self.remove_current_owner_member(&owner, member_id);
@@ -3250,17 +3253,14 @@ impl LuaMemberIndex {
         self.note_member_object_write(member_id);
         self.deferred_index_expr_members.remove(&member_id);
         self.member_function_scope_ranges.remove(&member_id);
-        if let Some((owner, key)) = reconciled_slot {
-            self.prune_reconciled_slot(&owner, &key);
-        }
         if removed {
             self.fold_file_fingerprint(member_id.file_id, file_member_element(member_id), false);
         }
     }
 
-    /// Drops the reconciled-slot mark of `(owner, key)` once the slot holds
-    /// no member any more, so marks never outlive the slots they describe
-    /// under file create/delete churn.
+    /// Drops the reconciled-slot mark of `(owner, key)` once neither
+    /// owner-key index holds a member for the slot any more, so marks never
+    /// outlive the slots they describe under file create/delete churn.
     ///
     /// The mark records that a full readmission scan of the slot merged
     /// nothing; an empty slot's scan cannot merge anything either, so
@@ -3268,7 +3268,15 @@ impl LuaMemberIndex {
     /// re-derives its coverage on the next mark, without a stale entry
     /// there to skip it.
     fn prune_reconciled_slot(&mut self, owner: &LuaMemberOwner, key: &LuaMemberKey) {
-        if self.history_slot_ids(owner, key).is_empty() {
+        let slot_is_empty = |index: &OwnerKeyMap| {
+            index
+                .get(owner)
+                .and_then(|slots| slots.get(key))
+                .is_none_or(|ids| ids.as_slice().is_empty())
+        };
+        if slot_is_empty(&self.member_owner_key_index)
+            && slot_is_empty(&self.member_owner_key_displaced)
+        {
             self.preserved_co_writer_reconciled
                 .remove(&(owner.clone(), key.clone()));
         }
@@ -3645,6 +3653,16 @@ impl LuaMemberIndex {
                 {
                     note_slot_write(&owner, key);
                 }
+            }
+            // The owner's slots went wholesale, so the reconciled marks
+            // they still hold go with them.
+            for key in visible
+                .iter()
+                .chain(displaced.iter())
+                .flat_map(HashMap::keys)
+            {
+                self.preserved_co_writer_reconciled
+                    .remove(&(owner.clone(), key.clone()));
             }
             note_owner_map_write(&owner);
             self.owner_history_fingerprints.remove(&owner);

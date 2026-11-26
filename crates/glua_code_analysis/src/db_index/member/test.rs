@@ -913,24 +913,33 @@ mod tests {
         assert_eq!(owner_member_ids(&index, &owner), vec![first_id, second_id]);
     }
 
-    /// Files two guarded self-assignment writers into one slot, in the
-    /// production order (added first, then marked), and returns the index.
-    fn index_with_reconciled_co_writers(
+    /// Files two guarded self-assignment writers into one slot of `index`,
+    /// in the production order (added first, then marked).
+    fn fill_reconciled_co_writers(
+        index: &mut LuaMemberIndex,
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
-        first_id: LuaMemberId,
-        second_id: LuaMemberId,
-    ) -> LuaMemberIndex {
-        let mut index = LuaMemberIndex::new();
-        for member_id in [first_id, second_id] {
+        ids: [LuaMemberId; 2],
+    ) {
+        for member_id in ids {
             index.add_member(
                 owner.clone(),
                 LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
             );
         }
-        for member_id in [first_id, second_id] {
+        for member_id in ids {
             index.mark_non_overwriting_assignment_member(member_id);
         }
+    }
+
+    /// A fresh index holding two reconciled co-writers in one slot.
+    fn index_with_reconciled_co_writers(
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+        ids: [LuaMemberId; 2],
+    ) -> LuaMemberIndex {
+        let mut index = LuaMemberIndex::new();
+        fill_reconciled_co_writers(&mut index, owner, key, ids);
         index
     }
 
@@ -941,9 +950,11 @@ mod tests {
     fn a_reconciled_slot_mark_drops_with_its_last_member() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
         let key = LuaMemberKey::name("field");
-        let first_id = make_index_member_id(FileId::new(1), 10);
-        let second_id = make_index_member_id(FileId::new(2), 20);
-        let mut index = index_with_reconciled_co_writers(&owner, &key, first_id, second_id);
+        let ids = [
+            make_index_member_id(FileId::new(1), 10),
+            make_index_member_id(FileId::new(2), 20),
+        ];
+        let mut index = index_with_reconciled_co_writers(&owner, &key, ids);
         let slot = (owner.clone(), key.clone());
 
         assert!(
@@ -951,46 +962,120 @@ mod tests {
             "a slot whose readmission merged nothing is marked"
         );
 
-        index.remove(first_id.file_id);
+        index.remove(ids[0].file_id);
         assert!(
             index.preserved_co_writer_reconciled.contains(&slot),
             "a slot that still holds a member keeps its mark"
         );
 
-        index.remove(second_id.file_id);
+        index.remove(ids[1].file_id);
         assert!(
             !index.preserved_co_writer_reconciled.contains(&slot),
             "the mark drops with the slot's last member"
         );
     }
 
-    /// A slot emptied by removal and re-created by later analysis still
-    /// readmits its co-writers: the members share one lookup item and the
-    /// fresh mark is re-derived, with no stale entry left to skip it.
+    /// A slot emptied by removal and re-created by later analysis into the
+    /// same index still readmits its co-writers: the members share one
+    /// lookup item and the fresh mark is re-derived, with no stale entry
+    /// left to skip it.
     #[test]
     fn a_recreated_slot_still_readmits_its_co_writers() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
         let key = LuaMemberKey::name("field");
-        let first_id = make_index_member_id(FileId::new(1), 10);
-        let second_id = make_index_member_id(FileId::new(2), 20);
-        let mut index = index_with_reconciled_co_writers(&owner, &key, first_id, second_id);
+        let ids = [
+            make_index_member_id(FileId::new(1), 10),
+            make_index_member_id(FileId::new(2), 20),
+        ];
+        let mut index = index_with_reconciled_co_writers(&owner, &key, ids);
 
-        index.remove(first_id.file_id);
-        index.remove(second_id.file_id);
+        index.remove(ids[0].file_id);
+        index.remove(ids[1].file_id);
         assert!(
             index
                 .get_current_owner_members_for_key(&owner, &key)
                 .is_empty()
         );
 
-        // Re-analysis of both files re-adds the same members and marks them.
-        let index = index_with_reconciled_co_writers(&owner, &key, first_id, second_id);
-        assert_eq!(owner_member_ids(&index, &owner), vec![first_id, second_id]);
+        // Re-analysis of both files re-adds the same members and marks
+        // them, into the same index the removals emptied.
+        fill_reconciled_co_writers(&mut index, &owner, &key, ids);
+        assert_eq!(owner_member_ids(&index, &owner), ids.to_vec());
         assert!(
             index
                 .preserved_co_writer_reconciled
                 .contains(&(owner.clone(), key.clone())),
             "the recreated slot's coverage is re-derived on the next mark"
+        );
+    }
+
+    /// A member that moved owners leaves its history behind under the old
+    /// one; the file-removal sweep that clears that history empties the
+    /// old slot, and its reconciled mark goes with it.
+    #[test]
+    fn a_sweep_emptied_slot_drops_its_reconciled_mark() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
+        let key = LuaMemberKey::name("field");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+        let mut index = LuaMemberIndex::new();
+
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
+        );
+        index.mark_non_overwriting_assignment_member(member_id);
+        let slot = (owner.clone(), key.clone());
+        assert!(
+            index.preserved_co_writer_reconciled.contains(&slot),
+            "the marked member's slot is marked"
+        );
+
+        index
+            .set_member_owner(new_owner, member_id.file_id, member_id)
+            .expect("owner move should succeed");
+        index.remove(member_id.file_id);
+        assert!(
+            !index.preserved_co_writer_reconciled.contains(&slot),
+            "the sweep empties the displaced slot and drops its mark"
+        );
+    }
+
+    /// Rekeying a marked member away from its key empties the old key's
+    /// slot, and its reconciled mark goes with it.
+    #[test]
+    fn a_rekey_emptied_slot_drops_its_reconciled_mark() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let old_key = LuaMemberKey::name("old_field");
+        let new_key = LuaMemberKey::name("new_field");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+        let mut index = LuaMemberIndex::new();
+
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                member_id,
+                old_key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        index.mark_non_overwriting_assignment_member(member_id);
+        assert!(
+            index
+                .preserved_co_writer_reconciled
+                .contains(&(owner.clone(), old_key.clone())),
+            "the marked member's slot is marked"
+        );
+
+        index
+            .rekey_member(member_id, new_key)
+            .expect("rekey should succeed");
+        assert!(
+            !index
+                .preserved_co_writer_reconciled
+                .contains(&(owner.clone(), old_key.clone())),
+            "the rekeyed-away slot's mark drops with the slot"
         );
     }
 
