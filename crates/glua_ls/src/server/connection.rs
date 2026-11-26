@@ -3,24 +3,26 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const INBOUND_CHANNEL_CAPACITY: usize = 256;
+
 /// Async wrapper for LSP Connection with tokio support
 pub struct AsyncConnection {
     pub(crate) connection: Arc<Connection>,
-    receiver: mpsc::UnboundedReceiver<Message>,
+    receiver: mpsc::Receiver<Message>,
     _receiver_task: tokio::task::JoinHandle<()>,
 }
 
 impl AsyncConnection {
     /// Create async version from sync Connection
     pub fn from_sync(connection: Connection) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
         let connection = Arc::new(connection);
 
         // Spawn blocking task to convert sync receiver to async
         let connection_clone = connection.clone();
         let receiver_task = tokio::task::spawn_blocking(move || {
             for msg in &connection_clone.receiver {
-                if tx.send(msg).is_err() {
+                if tx.blocking_send(msg).is_err() {
                     break; // Receiver closed
                 }
             }
