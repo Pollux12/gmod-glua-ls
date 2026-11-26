@@ -3,6 +3,7 @@ mod error;
 mod lsp_server;
 mod main_loop;
 mod message_processor;
+mod pending_queue;
 
 pub use connection::AsyncConnection;
 pub use error::ExitError;

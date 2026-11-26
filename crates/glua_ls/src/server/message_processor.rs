@@ -7,6 +7,7 @@ use crate::handlers::{on_notification_handler, on_request_handler, on_response_h
 
 use super::connection::AsyncConnection;
 use super::main_loop::InitResult;
+use super::pending_queue::PendingInitQueue;
 
 /// Outcome of server initialization observed by the message loop.
 ///
@@ -28,7 +29,7 @@ pub(super) struct ServerMessageProcessor {
     /// Whether the client sent `shutdown`: requests are refused from then on
     /// and `exit` ends the server cleanly.
     shutdown_requested: bool,
-    pub(super) pending_messages: Vec<Message>,
+    pub(super) pending: PendingInitQueue,
     pub(super) init_rx: oneshot::Receiver<InitResult>,
 }
 
@@ -37,9 +38,16 @@ impl ServerMessageProcessor {
         Self {
             initialization_complete: false,
             shutdown_requested: false,
-            pending_messages: Vec::new(),
+            pending: PendingInitQueue::new(),
             init_rx,
         }
+    }
+
+    /// Defers a message the server cannot process during initialization,
+    /// coalescing editor notification bursts so the queue stays bounded
+    /// while the workspace loads.
+    pub(super) fn queue_during_init(&mut self, msg: Message) {
+        self.pending.queue(msg);
     }
 
     /// Check if message can be processed during initialization: responses,
@@ -108,7 +116,7 @@ impl ServerMessageProcessor {
         connection: &mut AsyncConnection,
         server_context: &mut context::ServerContext,
     ) -> Result<bool, Box<dyn Error + Sync + Send>> {
-        let messages = std::mem::take(&mut self.pending_messages);
+        let messages = self.pending.take();
         for msg in messages {
             if self.handle_message(msg, connection, server_context).await? {
                 return Ok(true); // Exit requested
@@ -143,7 +151,7 @@ impl ServerMessageProcessor {
                 server_context.close().await;
                 // Requests held back while the workspace initialized are
                 // refused as any request after `shutdown` is.
-                for pending in std::mem::take(&mut self.pending_messages) {
+                for pending in self.pending.take() {
                     if let Message::Request(pending) = pending {
                         connection.send(
                             Response::new_err(
@@ -213,7 +221,7 @@ mod tests {
             let mut processor = ServerMessageProcessor::new(init_rx);
             let held = request(5, "textDocument/definition");
             let held_back = !processor.can_process_during_init(&held);
-            processor.pending_messages.push(held);
+            processor.queue_during_init(held);
             let handled_at_once = [request(1, "shutdown"), notification("exit")]
                 .iter()
                 .all(|msg| processor.can_process_during_init(msg));
