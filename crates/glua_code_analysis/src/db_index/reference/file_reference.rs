@@ -23,6 +23,29 @@ impl FileReference {
         }
     }
 
+    pub(super) fn from_parts(
+        decl_references: HashMap<LuaDeclId, (Vec<DeclReferenceCell>, bool)>,
+        mut references_to_decl: HashMap<TextRange, LuaDeclId>,
+    ) -> Self {
+        let mut compacted =
+            HashMap::with_capacity_and_hasher(decl_references.len(), Default::default());
+        for (decl_id, (cells, mutable)) in decl_references {
+            compacted.insert(
+                decl_id,
+                DeclReference {
+                    cells: SiteList::from(cells),
+                    mutable,
+                },
+            );
+        }
+        compacted.shrink_to_fit();
+        references_to_decl.shrink_to_fit();
+        Self {
+            decl_references: compacted,
+            references_to_decl,
+        }
+    }
+
     pub fn add_decl_reference(&mut self, decl_id: LuaDeclId, range: TextRange, is_write: bool) {
         if self.references_to_decl.contains_key(&range) {
             return;
@@ -35,11 +58,6 @@ impl FileReference {
             .entry(decl_id)
             .or_default()
             .add_cell(decl_ref);
-    }
-
-    pub(super) fn shrink_to_fit(&mut self) {
-        self.decl_references.shrink_to_fit();
-        self.references_to_decl.shrink_to_fit();
     }
 
     pub fn get_decl_references(&self, decl_id: &LuaDeclId) -> Option<&DeclReference> {

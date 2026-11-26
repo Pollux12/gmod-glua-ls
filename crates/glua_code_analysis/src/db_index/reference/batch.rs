@@ -5,8 +5,8 @@ use rowan::TextRange;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{
-    FileReference, StringReference, decl_reference_fingerprint, global_reference_fingerprint,
-    index_reference_fingerprint, string_reference_fingerprint,
+    DeclReferenceCell, FileReference, StringReference, decl_reference_fingerprint,
+    global_reference_fingerprint, index_reference_fingerprint, string_reference_fingerprint,
 };
 use crate::{
     FileId,
@@ -67,10 +67,11 @@ impl<K: Clone + Eq + Hash> OrderedNameSites<K> {
 /// `add_string_reference` would, made in order on a file with no references.
 pub struct FileReferenceBatch {
     file_id: FileId,
-    pub(super) file_reference: FileReference,
+    decl_references: HashMap<LuaDeclId, (Vec<DeclReferenceCell>, bool)>,
+    references_to_decl: HashMap<TextRange, LuaDeclId>,
     pub(super) globals: OrderedNameSites<InternedName>,
     pub(super) indexes: OrderedNameSites<LuaMemberKey>,
-    pub(super) strings: StringReference,
+    strings: HashMap<InternedName, Vec<TextRange>>,
     pub(super) string_fingerprints: HashMap<InternedName, Fingerprint>,
     pub(super) fingerprint: Fingerprint,
     pub(super) fingerprinted: bool,
@@ -81,10 +82,11 @@ impl FileReferenceBatch {
     pub fn new(file_id: FileId) -> Self {
         Self {
             file_id,
-            file_reference: FileReference::new(),
+            decl_references: HashMap::default(),
+            references_to_decl: HashMap::default(),
             globals: OrderedNameSites::default(),
             indexes: OrderedNameSites::default(),
-            strings: StringReference::new(),
+            strings: HashMap::default(),
             string_fingerprints: HashMap::default(),
             fingerprint: 0,
             fingerprinted: false,
@@ -96,13 +98,17 @@ impl FileReferenceBatch {
         self.file_id
     }
 
-    /// The declaration references collected so far.
-    pub fn file_reference(&self) -> &FileReference {
-        &self.file_reference
+    pub fn get_decl_id(&self, range: &TextRange) -> Option<LuaDeclId> {
+        self.references_to_decl.get(range).copied()
     }
 
-    pub fn into_file_reference(self) -> FileReference {
-        self.file_reference
+    pub(super) fn take_file_reference_and_strings(&mut self) -> (FileReference, StringReference) {
+        let file_reference = FileReference::from_parts(
+            std::mem::take(&mut self.decl_references),
+            std::mem::take(&mut self.references_to_decl),
+        );
+        let strings = StringReference::from_parts(std::mem::take(&mut self.strings));
+        (file_reference, strings)
     }
 
     fn add_fingerprint(&mut self, fingerprint: Fingerprint) {
@@ -111,9 +117,15 @@ impl FileReferenceBatch {
     }
 
     pub fn add_decl_reference(&mut self, decl_id: LuaDeclId, range: TextRange, is_write: bool) {
-        if self.file_reference.get_decl_id(&range).is_none() {
-            self.file_reference
-                .add_decl_reference(decl_id, range, is_write);
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            self.references_to_decl.entry(range)
+        {
+            slot.insert(decl_id);
+            let (cells, mutable) = self.decl_references.entry(decl_id).or_default();
+            if is_write {
+                *mutable = true;
+            }
+            cells.push(DeclReferenceCell { range, is_write });
             self.add_fingerprint(decl_reference_fingerprint(
                 self.file_id,
                 decl_id,
@@ -144,11 +156,9 @@ impl FileReferenceBatch {
     pub fn add_string_reference(&mut self, string: &str, range: TextRange) {
         let fingerprint = string_reference_fingerprint(self.file_id, string, &range);
         self.add_fingerprint(fingerprint);
-        let slot = self
-            .string_fingerprints
-            .entry(InternedName::new(string))
-            .or_default();
+        let key = InternedName::new(string);
+        let slot = self.string_fingerprints.entry(key.clone()).or_default();
         *slot = slot.wrapping_add(fingerprint);
-        self.strings.add_string_reference(string, range);
+        self.strings.entry(key).or_default().push(range);
     }
 }

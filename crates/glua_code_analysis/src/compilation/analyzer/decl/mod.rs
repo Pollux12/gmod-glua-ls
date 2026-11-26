@@ -7,7 +7,7 @@ mod stats;
 use rustc_hash::FxHashSet;
 
 use crate::db_index::{
-    DbIndex, FileReference, FileReferenceBatch, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind,
+    DbIndex, FileReferenceBatch, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind,
 };
 
 use super::{ScriptedScopes, common::estimate_file_index_entries};
@@ -55,12 +55,8 @@ pub(super) fn walk_file(db: &DbIndex, file_id: FileId, scopes: &ScriptedScopes) 
         delta,
         ..
     } = analyzer;
-    let reassignments = collect_local_reassignments(
-        references.file_reference(),
-        Some(&decl),
-        &assignment_sites,
-        file_id,
-    );
+    let reassignments =
+        collect_local_reassignments(&references, Some(&decl), &assignment_sites, file_id);
     DeclWalk {
         file_id,
         scoped_class_info,
@@ -78,7 +74,7 @@ pub(super) fn walk_file(db: &DbIndex, file_id: FileId, scopes: &ScriptedScopes) 
 /// sites are collected during the declaration walk and resolved after the
 /// file's references and declaration tree are complete.
 fn collect_local_reassignments(
-    references: &FileReference,
+    references: &FileReferenceBatch,
     decl_tree: Option<&LuaDeclarationTree>,
     assignment_sites: &[LuaAssignStat],
     file_id: FileId,
@@ -444,7 +440,6 @@ impl<'a> DeclAnalyzer<'a> {
         value.get_name_text().as_deref() == Some(decl.get_name())
             && self
                 .references
-                .file_reference()
                 .get_decl_id(&value.get_range())
                 .and_then(|source| self.decl.get_decl(&source))
                 .is_none_or(|source| source.is_global())

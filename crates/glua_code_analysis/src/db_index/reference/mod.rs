@@ -493,8 +493,8 @@ impl LuaReferenceIndex {
     pub fn file_batch(&mut self, mut batch: FileReferenceBatch) {
         let file_id = batch.file_id();
         derivation::note_write(|| FactKey::References(file_id));
-        batch.file_reference.shrink_to_fit();
-        *self.file_references.entry(file_id).or_default() = batch.file_reference;
+        let (file_reference, strings) = batch.take_file_reference_and_strings();
+        *self.file_references.entry(file_id).or_default() = file_reference;
         for entry in batch.globals.entries {
             derivation::note_write(|| FactKey::ReferencesByName(entry.name.as_str().into()));
             let slot = self
@@ -525,7 +525,7 @@ impl LuaReferenceIndex {
         *self
             .string_references
             .entry(file_id)
-            .or_insert_with(StringReference::new) = batch.strings;
+            .or_insert_with(StringReference::new) = strings;
         if batch.fingerprinted {
             self.add_file_fingerprint(file_id, batch.fingerprint);
         }

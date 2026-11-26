@@ -14,6 +14,16 @@ impl StringReference {
         }
     }
 
+    pub(super) fn from_parts(strings: FxHashMap<InternedName, Vec<TextRange>>) -> Self {
+        let mut string_references =
+            FxHashMap::with_capacity_and_hasher(strings.len(), Default::default());
+        for (string, ranges) in strings {
+            string_references.insert(string, SiteList::from(ranges));
+        }
+        string_references.shrink_to_fit();
+        Self { string_references }
+    }
+
     pub fn add_string_reference(&mut self, string: &str, range: TextRange) {
         self.string_references
             .entry(InternedName::new(string))
