@@ -1076,11 +1076,8 @@ impl EmmyLuaAnalysis {
             }
         }
 
-        self.compilation
-            .get_db_mut()
-            .get_json_schema_index_mut()
-            .reset_rest_schemas();
-        // Their tags bound nothing while the schema was unresolved.
+        // Their tags bound nothing while the schema was unresolved. URLs
+        // that did not resolve stay `NeedResolve` for a later retry.
         if !users.is_empty() {
             self.reindex_files(users);
         }

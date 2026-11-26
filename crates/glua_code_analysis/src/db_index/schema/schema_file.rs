@@ -5,7 +5,6 @@ use crate::LuaTypeDeclId;
 #[derive(Debug, Clone)]
 pub enum JsonSchemaFile {
     NeedResolve,
-    BadUrl,
     Resolved(LuaTypeDeclId),
 }
 
