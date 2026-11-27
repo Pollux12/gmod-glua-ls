@@ -1054,6 +1054,14 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Fetches pending schemas again without their backoff, off the caller's
+    /// path: a save may be what fixes a fetch that kept failing.
+    pub fn retry_schema_fetches(&self) {
+        if let Some(schema_fetch) = self.schema_fetch.as_ref() {
+            schema_fetch.retry_now();
+        }
+    }
+
     /// Background loop: waits for edits, debounces them, takes them into the
     /// re-analysis, then settles it in slices that release the analysis lock,
     /// so requests run between them. New edits pre-empt the slices and are

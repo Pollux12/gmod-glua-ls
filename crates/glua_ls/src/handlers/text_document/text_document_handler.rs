@@ -1,6 +1,5 @@
 use glua_code_analysis::{
-    DeferredVfsDrop, Emmyrc, FileId, convert_fetched_schemas, fetch_schema_urls,
-    read_file_with_encoding, uri_to_file_path,
+    DeferredVfsDrop, Emmyrc, FileId, read_file_with_encoding, uri_to_file_path,
 };
 use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 use lsp_types::{
@@ -96,35 +95,6 @@ async fn apply_document_update_without_queuing(
     }
 
     outcome
-}
-
-async fn check_schema_update(context: &ServerContextSnapshot) {
-    let urls = {
-        let read_analysis = context.analysis().read().await;
-        if !read_analysis.check_schema_update() {
-            return;
-        }
-
-        read_analysis.get_schemas_to_fetch()
-    };
-
-    if urls.is_empty() {
-        return;
-    }
-
-    let url_contents = fetch_schema_urls(urls).await;
-    if url_contents.is_empty() {
-        return;
-    }
-    let converted = convert_fetched_schemas(url_contents);
-
-    let mut write_analysis = context.analysis().write().await;
-    let applied = write_analysis.apply_fetched_schemas(converted);
-    drop(write_analysis);
-    context
-        .debounced_analysis()
-        .rediagnose_schema_affected(applied.affected)
-        .await;
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -234,7 +204,7 @@ pub async fn on_did_save_text_document(
         workspace.recheck_workspace(delay, context.clone()).await;
     }
 
-    check_schema_update(&context).await;
+    context.debounced_analysis().retry_schema_fetches();
     Some(())
 }
 

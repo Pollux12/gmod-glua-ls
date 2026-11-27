@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glua_code_analysis::{
     EmmyLuaAnalysis, FileId, Url, convert_fetched_schemas, fetch_schema_urls,
@@ -14,6 +15,7 @@ const FETCH_RETRY_WAKES: u32 = 3;
 
 pub(crate) struct SchemaFetcher {
     wake: Arc<Notify>,
+    force: Arc<AtomicBool>,
 }
 
 impl SchemaFetcher {
@@ -23,11 +25,25 @@ impl SchemaFetcher {
         rediagnose: UnboundedSender<Vec<FileId>>,
     ) -> Arc<Self> {
         let wake = Arc::new(Notify::new());
-        tokio::spawn(worker(analysis, shutdown, wake.clone(), rediagnose));
-        Arc::new(Self { wake })
+        let force = Arc::new(AtomicBool::new(false));
+        tokio::spawn(worker(
+            analysis,
+            shutdown,
+            wake.clone(),
+            force.clone(),
+            rediagnose,
+        ));
+        Arc::new(Self { wake, force })
     }
 
     pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Fetches pending schemas again without their backoff, for a save that
+    /// may be what fixes a fetch that kept failing.
+    pub fn retry_now(&self) {
+        self.force.store(true, Ordering::Release);
         self.wake.notify_one();
     }
 }
@@ -70,19 +86,29 @@ impl FetchAttempts {
             self.retry_in.remove(url);
         }
     }
+
+    /// Drops every wait, so the next wake takes all candidates.
+    fn clear(&mut self) {
+        self.retry_in.clear();
+    }
 }
 
 async fn worker(
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     shutdown: CancellationToken,
     wake: Arc<Notify>,
+    force: Arc<AtomicBool>,
     rediagnose: UnboundedSender<Vec<FileId>>,
 ) {
     let mut attempts = FetchAttempts::default();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = wake.notified() => {}
+            _ = wake.notified() => {
+                if force.swap(false, Ordering::AcqRel) {
+                    attempts.clear();
+                }
+            }
         }
         let urls = {
             let read_analysis = analysis.read().await;
@@ -148,6 +174,19 @@ mod tests {
         attempts.attempted(&[config_url()]);
 
         attempts.resolved(&[config_url()]);
+
+        assert_eq!(attempts.due(vec![config_url()]), vec![config_url()]);
+    }
+
+    /// A forced retry drops the wait, so a save takes a url the backoff held.
+    #[test]
+    fn a_forced_retry_takes_a_url_still_waiting() {
+        let mut attempts = FetchAttempts::default();
+        attempts.attempted(&[config_url()]);
+
+        assert!(attempts.due(vec![config_url()]).is_empty());
+
+        attempts.clear();
 
         assert_eq!(attempts.due(vec![config_url()]), vec![config_url()]);
     }
