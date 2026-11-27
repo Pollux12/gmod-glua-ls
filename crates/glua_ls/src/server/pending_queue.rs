@@ -1,4 +1,5 @@
 use lsp_server::Message;
+use serde::Deserialize;
 use std::collections::HashSet;
 
 use lsp_types::Uri;
@@ -7,7 +8,8 @@ use lsp_types::notification::{
     Notification as LspNotification,
 };
 use lsp_types::{
-    DidChangeTextDocumentParams, TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
 };
 
 use crate::context::EditorDocuments;
@@ -34,9 +36,8 @@ impl PendingInitQueue {
         };
         match notification.method.as_str() {
             DidOpenTextDocument::METHOD => {
-                let Ok(params) = serde_json::from_value::<lsp_types::DidOpenTextDocumentParams>(
-                    notification.params.clone(),
-                ) else {
+                let Ok(params) = DidOpenTextDocumentParams::deserialize(&notification.params)
+                else {
                     self.messages.push(Message::Notification(notification));
                     return;
                 };
@@ -48,9 +49,8 @@ impl PendingInitQueue {
                 self.messages.push(Message::Notification(notification));
             }
             DidChangeTextDocument::METHOD => {
-                let Ok(params) = serde_json::from_value::<DidChangeTextDocumentParams>(
-                    notification.params.clone(),
-                ) else {
+                let Ok(params) = DidChangeTextDocumentParams::deserialize(&notification.params)
+                else {
                     self.messages.push(Message::Notification(notification));
                     return;
                 };
@@ -87,9 +87,8 @@ impl PendingInitQueue {
                 }
             }
             DidCloseTextDocument::METHOD => {
-                let Ok(params) = serde_json::from_value::<lsp_types::DidCloseTextDocumentParams>(
-                    notification.params.clone(),
-                ) else {
+                let Ok(params) = DidCloseTextDocumentParams::deserialize(&notification.params)
+                else {
                     self.messages.push(Message::Notification(notification));
                     return;
                 };
@@ -101,9 +100,8 @@ impl PendingInitQueue {
                 self.messages.push(Message::Notification(notification));
             }
             DidSaveTextDocument::METHOD => {
-                let Ok(params) = serde_json::from_value::<lsp_types::DidSaveTextDocumentParams>(
-                    notification.params.clone(),
-                ) else {
+                let Ok(params) = DidSaveTextDocumentParams::deserialize(&notification.params)
+                else {
                     self.messages.push(Message::Notification(notification));
                     return;
                 };
