@@ -4357,6 +4357,108 @@ local EscapeStringMap: {
         Ok(())
     }
 
+    /// Hovering the LHS of a `---@type`-annotated `= nil` field write must
+    /// keep the annotated type, not collapse to the assigned `nil`.
+    #[gtest]
+    fn doc_typed_nil_field_assign_lhs_hover_keeps_annotated_type() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class GlideWheelBoneConfig
+                ---@field wheel? integer
+
+                ---@type GlideWheelBoneConfig[]
+                ENT.Wheel<??>Bones = nil
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert_eq!(
+            value, "```lua\n(field) WheelBones: GlideWheelBoneConfig[]\n```",
+            "doc-typed `= nil` assignment LHS should hover as the annotated type"
+        );
+        Ok(())
+    }
+
+    /// Read-site hover of a `---@type`-annotated `= nil` field write keeps the
+    /// annotated type in a GMod scripted entity scope.
+    #[gtest]
+    fn doc_typed_nil_field_assign_read_site_hover_keeps_annotated_type() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class GlideWheelBoneConfig
+                ---@field wheel? integer
+
+                ---@type GlideWheelBoneConfig[]
+                ENT.WheelBones = nil
+
+                local bones = ENT.Wheel<??>Bones
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
+        let value = extract_hover_markdown(&ws, file_id, position);
+
+        assert_eq!(
+            value, "```lua\n(field) WheelBones: GlideWheelBoneConfig[]\n```",
+            "read site of a doc-typed `= nil` write should hover as the annotated type"
+        );
+        Ok(())
+    }
+
+    /// Same behavior outside GMod scripted scopes: a plain table field write
+    /// annotated with `---@type ... = nil` hovers as the annotated type, and a
+    /// `---@type`-annotated global `= nil` write hovers as the annotated type.
+    #[gtest]
+    fn doc_typed_nil_assign_hover_keeps_annotated_type_plain_workspace() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class PlainWheelBoneConfig
+                ---@field wheel? integer
+
+                local ent = {}
+                ---@type PlainWheelBoneConfig[]
+                ent.Wheel<??>Bones = nil
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) WheelBones: PlainWheelBoneConfig[]\n```".to_string(),
+            },
+        ));
+
+        check!(ws.check_hover(
+            r#"
+                ---@class PlainWheelBoneConfig2
+                ---@field wheel? integer
+
+                ---@type PlainWheelBoneConfig2[]
+                Wheel<??>BonesGlobal = nil
+            "#,
+            VirtualHoverResult {
+                value:
+                    "```lua\n(global) WheelBonesGlobal: PlainWheelBoneConfig2[]\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
     /// Read-site hover where the entity local comes from `self.seats[index]`
     /// in a different method than the branched assignment. Mirrors
     /// `cityrp-vehicle-base/init.lua:559` (`local seat = self.seats[index]`

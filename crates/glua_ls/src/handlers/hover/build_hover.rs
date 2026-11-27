@@ -1205,6 +1205,12 @@ fn get_assignment_target_type(
     semantic_model: &SemanticModel,
 ) -> Option<LuaType> {
     let target = get_plain_assignment_target_for_token(trigger_token)?;
+    // A doc tag on the assignment statement (e.g. `---@type T` on
+    // `ENT.Foo = nil`) owns the target's type; keep it instead of the raw
+    // assigned value, which is `nil` for an annotation-only delete.
+    if let Some(doc_type) = semantic_model.plain_assignment_target_doc_type(&target) {
+        return Some(doc_type);
+    }
     semantic_model.infer_plain_assignment_target_value(&target)
 }
 

@@ -1,7 +1,7 @@
 mod call_site_params;
 pub(crate) mod call_target;
 mod common;
-mod decl;
+pub(crate) mod decl;
 mod derive;
 mod doc;
 mod dynamic_field;
@@ -21,6 +21,7 @@ pub(crate) use common::{
     is_falsy_literal_expr, is_nil_literal_expr, is_presence_tested, settled_covers_cached_type,
     settled_extends_cached_classes, union_widens_cached_type, widen_mutable_decl_literal,
 };
+pub(crate) use decl::stats::assign_stat_var_carries_doc_type;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use dynamic_field::{
     copies_table_into_itself, for_range_pairs_source_for_var, writes_own_pairs_key,

@@ -223,7 +223,11 @@ async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<Offere
     };
     context
         .client()
-        .apply_edit(ApplyWorkspaceEditParams { label: None, edit }, shutdown)
+        .apply_edit(
+            ApplyWorkspaceEditParams { label: None, edit },
+            shutdown,
+            crate::context::USER_ANSWERED_REQUEST_TIMEOUT,
+        )
         .await;
 }
 

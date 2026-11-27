@@ -4,7 +4,7 @@ mod test {
 
     use crate::{
         DiagnosticCode, FileId, LuaDocDefaultValue, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-        LuaTypeDeclId, VirtualWorkspace,
+        LuaTypeDeclId, VirtualWorkspace, convert_fetched_schemas,
     };
 
     fn index_expr_ty(ws: &VirtualWorkspace, file_id: FileId, expr_text: &str) -> LuaType {
@@ -1569,11 +1569,56 @@ local value = receiver.value
         let schema =
             r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
 
-        ws.analysis
-            .apply_fetched_schemas(std::collections::HashMap::from([(url, schema.to_string())]));
+        ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url, schema.to_string())]),
+        ));
 
         let typ = ws.local_ty(file_id, "config");
         assert!(matches!(typ, LuaType::Ref(_)), "{typ:?}");
+    }
+
+    /// A schema that resolved reports the url it resolved and the files it
+    /// retyped, so a background fetch can re-diagnose them.
+    #[test]
+    fn a_resolved_schema_reports_the_files_it_retyped() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "---@schema https://example.com/config.json\nlocal config = {}\n",
+        );
+        let url = url::Url::parse("https://example.com/config.json").expect("a URL");
+        let schema =
+            r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
+
+        let applied = ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url.clone(), schema.to_string())]),
+        ));
+
+        assert_eq!(applied.resolved, vec![url]);
+        assert!(
+            applied.affected.contains(&file_id),
+            "{:?}",
+            applied.affected
+        );
+    }
+
+    /// Content that does not convert resolves nothing, so the fetch that
+    /// reported it is not treated as done.
+    #[test]
+    fn schema_content_that_does_not_convert_resolves_nothing() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "---@schema https://example.com/config.json\nlocal config = {}\n",
+        );
+        let url = url::Url::parse("https://example.com/config.json").expect("a URL");
+
+        let applied = ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url, "{".to_string())]),
+        ));
+
+        assert!(applied.resolved.is_empty());
+        assert!(applied.affected.is_empty(), "{:?}", applied.affected);
     }
 
     /// A receiver out-param added to or taken from a method in another file

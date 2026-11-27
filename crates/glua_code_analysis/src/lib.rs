@@ -47,7 +47,7 @@ use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
 pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
-use url::Url;
+pub use url::Url;
 pub use vfs::*;
 
 /// Stack size for any thread that runs analysis.
@@ -134,8 +134,20 @@ pub fn call_expr_is_net_op(
     db_index::signature_has_net_op_metadata(db, signature_id)
 }
 
+const SCHEMA_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
     let mut url_contents = HashMap::default();
+    let client = match reqwest::Client::builder()
+        .timeout(SCHEMA_FETCH_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            log::error!("Failed to build schema fetch client: {}", err);
+            return url_contents;
+        }
+    };
     for url in urls {
         if url.scheme() == "file" {
             if let Ok(path) = url.to_file_path()
@@ -149,7 +161,7 @@ pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
                 }
             }
         } else {
-            let result = reqwest::get(url.as_str()).await;
+            let result = client.get(url.as_str()).send().await;
             if let Ok(response) = result {
                 if let Ok(content) = response.text().await {
                     url_contents.insert(url, content);
@@ -267,6 +279,15 @@ pub struct ConfigApplied {
     pub shared: EmmyrcChange,
     /// The files of the roots whose own config reaches the index, sorted.
     pub files: Vec<FileId>,
+}
+
+/// What applying fetched schema content reached.
+#[derive(Debug, Default)]
+pub struct AppliedSchemas {
+    /// The urls whose content converted and whose schema now resolves.
+    pub resolved: Vec<Url>,
+    /// The live files whose diagnostics may have changed, sorted.
+    pub affected: Vec<FileId>,
 }
 
 #[derive(Debug)]
@@ -568,14 +589,20 @@ impl EmmyLuaAnalysis {
         affected
     }
 
-    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
+    /// Sets a remote file's text and re-analyses it. Returns the file and every
+    /// live file whose diagnostics may have changed.
+    pub fn update_remote_file_by_uri(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+    ) -> (FileId, Vec<FileId>) {
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_remote_file_content(uri, text);
-        self.reindex_files(vec![file_id]);
-        file_id
+        let affected = self.reindex_files(vec![file_id]);
+        (file_id, affected)
     }
 
     /// Sets every file's text in one batch and re-analyses them together.
@@ -1016,65 +1043,75 @@ impl EmmyLuaAnalysis {
             .get_need_resolve_schemas()
     }
 
-    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) {
-        if url_contents.is_empty() {
-            return;
-        }
-
-        let converter = SchemaConverter::new(true);
+    /// Applies converted schema content for each url, marking each schema
+    /// resolved and retyping its users. Reports which urls now resolve and
+    /// every live file whose diagnostics may have changed. Pair it with
+    /// [`convert_fetched_schemas`], which needs no write lock.
+    pub fn apply_fetched_schemas(
+        &mut self,
+        converted: Vec<(Url, String, String)>,
+    ) -> AppliedSchemas {
+        let mut applied = AppliedSchemas::default();
         let mut users = Vec::new();
-        for (url, json_content) in url_contents {
-            // let short_name = get_schema_short_name(&url);
-            match converter.convert_from_str(&json_content) {
-                Ok(convert_result) => {
-                    let uri = match Uri::from_str(url.as_str()) {
-                        Ok(uri) => uri,
-                        Err(e) => {
-                            log::error!("Failed to convert URL to URI {:?}: {}", url, e);
-                            continue;
-                        }
-                    };
-                    let file_id =
-                        self.update_remote_file_by_uri(&uri, Some(convert_result.annotation_text));
-                    if let Some(f) = self
-                        .compilation
-                        .get_db_mut()
-                        .get_json_schema_index_mut()
-                        .get_schema_file_mut(&url)
-                    {
-                        *f = JsonSchemaFile::Resolved(LuaTypeDeclId::local(
-                            file_id,
-                            &convert_result.root_type_name,
-                        ));
-                    }
-                    users.extend(
-                        self.compilation
-                            .get_db()
-                            .get_json_schema_index()
-                            .users_of(&url),
-                    );
-                }
+        for (url, annotation_text, root_type_name) in converted {
+            let uri = match Uri::from_str(url.as_str()) {
+                Ok(uri) => uri,
                 Err(e) => {
-                    log::error!("Failed to convert schema from URL {:?}: {}", url, e);
+                    log::error!("Failed to convert URL to URI {:?}: {}", url, e);
+                    continue;
                 }
+            };
+            let (file_id, affected) = self.update_remote_file_by_uri(&uri, Some(annotation_text));
+            applied.affected.extend(affected);
+            if let Some(f) = self
+                .compilation
+                .get_db_mut()
+                .get_json_schema_index_mut()
+                .get_schema_file_mut(&url)
+            {
+                *f = JsonSchemaFile::Resolved(LuaTypeDeclId::local(file_id, &root_type_name));
             }
+            users.extend(
+                self.compilation
+                    .get_db()
+                    .get_json_schema_index()
+                    .users_of(&url),
+            );
+            applied.resolved.push(url);
         }
 
-        self.compilation
-            .get_db_mut()
-            .get_json_schema_index_mut()
-            .reset_rest_schemas();
-        // Their tags bound nothing while the schema was unresolved.
         if !users.is_empty() {
-            self.reindex_files(users);
+            applied.affected.extend(self.reindex_files(users));
         }
+        applied.affected.sort_unstable();
+        applied.affected.dedup();
+        applied
     }
 
     pub async fn update_schema(&mut self) {
         let urls = self.get_schemas_to_fetch();
         let url_contents = fetch_schema_urls(urls).await;
-        self.apply_fetched_schemas(url_contents);
+        self.apply_fetched_schemas(convert_fetched_schemas(url_contents));
     }
+}
+
+/// Converts fetched JSON schema content into the `(url, annotation_text,
+/// root_type_name)` pairs [`EmmyLuaAnalysis::apply_fetched_schemas`] applies.
+/// Content that does not convert is logged and dropped.
+pub fn convert_fetched_schemas(url_contents: HashMap<Url, String>) -> Vec<(Url, String, String)> {
+    let converter = SchemaConverter::new(true);
+    let mut converted = Vec::new();
+    for (url, json_content) in url_contents {
+        match converter.convert_from_str(&json_content) {
+            Ok(convert_result) => converted.push((
+                url,
+                convert_result.annotation_text,
+                convert_result.root_type_name,
+            )),
+            Err(e) => log::error!("Failed to convert schema from URL {:?}: {}", url, e),
+        }
+    }
+    converted
 }
 
 impl Default for EmmyLuaAnalysis {

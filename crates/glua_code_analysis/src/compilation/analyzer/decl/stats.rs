@@ -277,7 +277,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
 /// `---@class`, `---@enum`, `---@module`, and `---@schema` bind the first var
 /// only. Other tags (`---@deprecated`, `---@field`, ...) write properties or
 /// unrelated owners and never make the member resolvable.
-fn assign_stat_var_carries_doc_type(stat: &LuaAssignStat, var_idx: usize) -> bool {
+pub(crate) fn assign_stat_var_carries_doc_type(stat: &LuaAssignStat, var_idx: usize) -> bool {
     stat.get_comments()
         .iter()
         .flat_map(|comment| comment.get_doc_tags())

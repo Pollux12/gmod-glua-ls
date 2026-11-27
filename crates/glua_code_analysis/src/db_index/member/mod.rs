@@ -255,12 +255,6 @@ pub struct LuaMemberIndex {
     expr_key_members_by_file: CowShards<FileId, HashSet<LuaMemberId>>,
     non_overwriting_assignment_members: CowShardSet<LuaMemberId>,
     /// `(owner, key)` slots whose last co-writer readmission merged nothing.
-    ///
-    /// See [`Self::readmit_preserved_assignment_co_writers`]: every later
-    /// scan of such a slot is a proven no-op, so marks skip the walk. Only
-    /// `clear` drops entries, with the index they describe — every other
-    /// mutation preserves the coverage they record, and any future history
-    /// write without a paired item merge must clear its slot here.
     preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
@@ -1697,6 +1691,7 @@ impl LuaMemberIndex {
             self.fold_history_fingerprint(owner, history_element(&key, id), false);
             note_slot_write(owner, &key);
         }
+        self.prune_reconciled_slot(owner, &key);
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
@@ -1719,6 +1714,7 @@ impl LuaMemberIndex {
             for (owner, key, id) in &visible {
                 note_slot_write(owner, key);
                 self.fold_history_fingerprint(owner, history_element(key, *id), false);
+                self.prune_reconciled_slot(owner, key);
             }
         } else {
             let mut seen = HashSet::with_capacity_and_hasher(
@@ -1729,6 +1725,7 @@ impl LuaMemberIndex {
                 if seen.insert((owner.clone(), key.clone(), id)) {
                     note_slot_write(&owner, &key);
                     self.fold_history_fingerprint(&owner, history_element(&key, id), false);
+                    self.prune_reconciled_slot(&owner, &key);
                 }
             }
         }
@@ -3241,6 +3238,21 @@ impl LuaMemberIndex {
         }
     }
 
+    fn prune_reconciled_slot(&mut self, owner: &LuaMemberOwner, key: &LuaMemberKey) {
+        let slot_is_empty = |index: &OwnerKeyMap| {
+            index
+                .get(owner)
+                .and_then(|slots| slots.get(key))
+                .is_none_or(|ids| ids.as_slice().is_empty())
+        };
+        if slot_is_empty(&self.member_owner_key_index)
+            && slot_is_empty(&self.member_owner_key_displaced)
+        {
+            self.preserved_co_writer_reconciled
+                .remove(&(owner.clone(), key.clone()));
+        }
+    }
+
     /// The per-file half of removal: erase every entry keyed or owned by
     /// `file_id`. The whole-index owner-key sweeps are done once per batch in
     /// `remove_files`, not here — running them per file made removal cost
@@ -3612,6 +3624,14 @@ impl LuaMemberIndex {
                 {
                     note_slot_write(&owner, key);
                 }
+            }
+            for key in visible
+                .iter()
+                .chain(displaced.iter())
+                .flat_map(HashMap::keys)
+            {
+                self.preserved_co_writer_reconciled
+                    .remove(&(owner.clone(), key.clone()));
             }
             note_owner_map_write(&owner);
             self.owner_history_fingerprints.remove(&owner);

@@ -151,27 +151,15 @@ impl LspServer {
                         }
                     } else {
                         match msg {
-                            Message::Request(request) => {
-                                if should_fail_fast_request_during_init(&request.method) {
-                                    // During startup, fail fast for editor data requests instead
-                                    // of queueing them behind full workspace initialization.
-                                    // Clients will re-request after initialization and avoid
-                                    // perceived 10-20s startup request stalls.
-                                    let response = self
-                                        .server_context
-                                        .refused_during_init(request.id, &request.method);
-                                    self.connection.send(response.into())?;
-                                } else {
-                                    // Preserve one-shot/critical request semantics by
-                                    // deferring them until initialization completes.
-                                    self.processor
-                                        .pending_messages
-                                        .push(Message::Request(request));
-                                }
+                            Message::Request(request)
+                                if should_fail_fast_request_during_init(&request.method) =>
+                            {
+                                let response = self
+                                    .server_context
+                                    .refused_during_init(request.id, &request.method);
+                                self.connection.send(response.into())?;
                             }
-                            other => {
-                                self.processor.pending_messages.push(other);
-                            }
+                            msg => self.processor.queue_during_init(msg),
                         }
                     }
                 }

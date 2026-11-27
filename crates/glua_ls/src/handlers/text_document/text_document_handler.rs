@@ -1,5 +1,5 @@
 use glua_code_analysis::{
-    DeferredVfsDrop, Emmyrc, FileId, fetch_schema_urls, read_file_with_encoding, uri_to_file_path,
+    DeferredVfsDrop, Emmyrc, FileId, read_file_with_encoding, uri_to_file_path,
 };
 use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 use lsp_types::{
@@ -95,26 +95,6 @@ async fn apply_document_update_without_queuing(
     }
 
     outcome
-}
-
-async fn check_schema_update(context: &ServerContextSnapshot) {
-    let urls = {
-        let read_analysis = context.analysis().read().await;
-        if !read_analysis.check_schema_update() {
-            return;
-        }
-
-        read_analysis.get_schemas_to_fetch()
-    };
-
-    if urls.is_empty() {
-        return;
-    }
-
-    let url_contents = fetch_schema_urls(urls).await;
-
-    let mut write_analysis = context.analysis().write().await;
-    write_analysis.apply_fetched_schemas(url_contents);
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -224,7 +204,7 @@ pub async fn on_did_save_text_document(
         workspace.recheck_workspace(delay, context.clone()).await;
     }
 
-    check_schema_update(&context).await;
+    context.debounced_analysis().retry_schema_fetches();
     Some(())
 }
 
@@ -424,15 +404,19 @@ mod tests {
     use super::*;
     use crate::context::ServerContext;
     use crate::util::TempDir;
+    use glua_code_analysis::{DiagnosticCode, JsonSchemaFile};
     use googletest::prelude::*;
     use lsp_server::Connection;
     use lsp_types::{
-        ClientCapabilities, SemanticTokensWorkspaceClientCapabilities, TextDocumentItem, Uri,
+        ClientCapabilities, NumberOrString, PublishDiagnosticsParams,
+        SemanticTokensWorkspaceClientCapabilities, TextDocumentItem, Uri,
         WorkspaceClientCapabilities,
     };
+    use std::future::Future;
     use std::str::FromStr;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+    use url::Url;
 
     /// The client asks for an opened document's tokens itself, so opening one
     /// sends no workspace-wide semantic token refresh.
@@ -794,6 +778,207 @@ mod tests {
                     .and_then(|file_id| vfs.get_file_content(&file_id).cloned())
             };
             verify_that!(read.as_deref(), some(eq(NEW_TEXT)))
+        })
+    }
+
+    const SCHEMA_JSON: &str =
+        r#"{"title":"Cfg","type":"object","properties":{"port":{"type":"integer"}}}"#;
+
+    async fn context_with_main_workspace(name: &str) -> (ServerContext, Connection, Uri, TempDir) {
+        let (connection, peer) = Connection::memory();
+        let context = ServerContext::new(connection, ClientCapabilities::default());
+        let folder = TempDir::new(&format!("gmod_glua_ls_{name}"));
+        let doc_path = folder.join("doc.lua");
+        std::fs::write(&doc_path, DISK_TEXT).expect("document should be written");
+        let doc_uri =
+            glua_code_analysis::file_path_to_uri(&doc_path).expect("document URI should parse");
+        {
+            let snapshot = context.snapshot();
+            let mut analysis = snapshot.analysis().write().await;
+            analysis.add_main_workspace(folder.to_path_buf());
+            analysis.update_file_by_uri(&doc_uri, Some(DISK_TEXT.to_string()));
+        }
+        (context, peer, doc_uri, folder)
+    }
+
+    async fn eventually<T, P>(timeout: Duration, mut read: impl FnMut() -> P) -> Option<T>
+    where
+        P: Future<Output = Option<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = read().await {
+                return Some(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn schema_is_pending(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
+        let analysis = snapshot.analysis().read().await;
+        matches!(
+            analysis
+                .compilation
+                .get_db()
+                .get_json_schema_index()
+                .get_schema_file(url),
+            Some(JsonSchemaFile::NeedResolve)
+        )
+    }
+
+    async fn schema_is_resolved(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
+        let analysis = snapshot.analysis().read().await;
+        matches!(
+            analysis
+                .compilation
+                .get_db()
+                .get_json_schema_index()
+                .get_schema_file(url),
+            Some(JsonSchemaFile::Resolved(_))
+        )
+    }
+
+    /// Whether the diagnostics the client was sent since the last poll carry
+    /// `code`; drains what it was sent.
+    fn was_published(peer: &Connection, code: DiagnosticCode) -> bool {
+        let code = Some(NumberOrString::String(code.get_name().to_string()));
+        peer.receiver.try_iter().any(|message| match message {
+            lsp_server::Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                serde_json::from_value::<PublishDiagnosticsParams>(notification.params).is_ok_and(
+                    |published| {
+                        published
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.code == code)
+                    },
+                )
+            }
+            _ => false,
+        })
+    }
+
+    fn schema_url(folder: &TempDir, name: &str) -> Url {
+        Url::parse(
+            glua_code_analysis::file_path_to_uri(&folder.join(name))
+                .expect("schema URI should parse")
+                .as_str(),
+        )
+        .expect("schema URL should parse")
+    }
+
+    #[gtest]
+    fn an_edited_schema_tag_resolves_without_a_save() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, doc_uri, folder) =
+                context_with_main_workspace("schema_settled").await;
+            let snapshot = context.snapshot();
+            std::fs::write(folder.join("schema.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
+            let schema_url = schema_url(&folder, "schema.json");
+
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!("---@schema {schema_url}\nlocal x = 1\n"),
+            )
+            .await;
+
+            let resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &schema_url)
+                    .await
+                    .then_some(())
+            })
+            .await;
+            verify_that!(resolved, some(eq(())))
+        })
+    }
+
+    /// A document diagnosed before the background fetch resolved its schema is
+    /// diagnosed again once it resolves, so what only the schema makes wrong
+    /// reaches the client.
+    #[gtest]
+    fn a_schema_resolving_rediagnoses_the_document_that_uses_it() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, peer, doc_uri, folder) =
+                context_with_main_workspace("schema_rediagnosed").await;
+            let snapshot = context.snapshot();
+            std::fs::write(folder.join("schema.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
+            let schema_url = schema_url(&folder, "schema.json");
+
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!(
+                    "---@schema {schema_url}\nlocal config = {{}}\nlocal port = config.missing\n"
+                ),
+            )
+            .await;
+
+            let rediagnosed = eventually(Duration::from_secs(10), || async {
+                was_published(&peer, DiagnosticCode::UndefinedField).then_some(())
+            })
+            .await;
+            verify_that!(rediagnosed, some(eq(())))
+        })
+    }
+
+    #[gtest]
+    fn a_missing_schema_file_resolves_on_the_save_after_its_creation() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, doc_uri, folder) =
+                context_with_main_workspace("schema_retry").await;
+            let snapshot = context.snapshot();
+            let good_url = schema_url(&folder, "good.json");
+            let missing_url = schema_url(&folder, "missing.json");
+            std::fs::write(folder.join("good.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
+
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!("---@schema {good_url}\n---@schema {missing_url}\nlocal x = 1\n"),
+            )
+            .await;
+
+            let good_resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &good_url).await.then_some(())
+            })
+            .await;
+            verify_that!(good_resolved, some(eq(())))?;
+            verify_that!(schema_is_pending(&snapshot, &missing_url).await, eq(true))?;
+
+            std::fs::write(folder.join("missing.json"), SCHEMA_JSON)
+                .expect("missing schema should be created");
+            on_did_save_text_document(
+                snapshot.clone(),
+                DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    text: None,
+                },
+            )
+            .await;
+
+            let missing_resolved = eventually(Duration::from_secs(10), || async {
+                schema_is_resolved(&snapshot, &missing_url)
+                    .await
+                    .then_some(())
+            })
+            .await;
+            verify_that!(missing_resolved, some(eq(())))
         })
     }
 }

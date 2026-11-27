@@ -4,6 +4,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicI32, Ordering},
     },
+    time::Duration,
 };
 
 use lsp_server::{Connection, Message, Notification, RequestId, Response};
@@ -47,6 +48,8 @@ enum RefreshRequestKind {
     InlayHints,
     CodeLens,
 }
+
+pub(crate) const USER_ANSWERED_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl RefreshRequestKind {
     const fn method(self) -> &'static str {
@@ -94,14 +97,13 @@ impl ClientProxy {
         }));
     }
 
-    /// Sends a request and waits for its response, or for `cancel_token`; a
-    /// request whose token is already cancelled is never sent.
     pub async fn send_request(
         &self,
         id: RequestId,
         method: &str,
         params: impl serde::Serialize,
         cancel_token: CancellationToken,
+        timeout: Duration,
     ) -> Option<Response> {
         if cancel_token.is_cancelled() {
             return None;
@@ -125,14 +127,31 @@ impl ClientProxy {
             }
         };
 
-        let _ = self.conn.sender.send(Message::Request(lsp_server::Request {
-            id: id.clone(),
-            method: method.to_string(),
-            params,
-        }));
+        if self
+            .conn
+            .sender
+            .send(Message::Request(lsp_server::Request {
+                id: id.clone(),
+                method: method.to_string(),
+                params,
+            }))
+            .is_err()
+        {
+            log::warn!(
+                "request {} ({}) could not be sent; the client is gone",
+                id,
+                method
+            );
+            self.response_manager.lock().await.remove(&id);
+            return None;
+        }
         let response = select! {
             response = receiver => response.ok(),
             _ = cancel_token.cancelled() => None,
+            _ = tokio::time::sleep(timeout) => {
+                log::warn!("request {} ({}) got no response within {:?}; giving up", id, method, timeout);
+                None
+            }
         };
         self.response_manager.lock().await.remove(&id);
         response
@@ -252,14 +271,20 @@ impl ClientProxy {
     pub async fn get_configuration<C>(
         &self,
         params: ConfigurationParams,
-        cancel_token: CancellationToken,
+        timeout: Duration,
     ) -> Option<Vec<C>>
     where
         C: DeserializeOwned,
     {
         let request_id = self.next_id();
         let response = self
-            .send_request(request_id, "workspace/configuration", params, cancel_token)
+            .send_request(
+                request_id,
+                "workspace/configuration",
+                params,
+                CancellationToken::new(),
+                timeout,
+            )
             .await?;
         serde_json::from_value(response.result?).ok()
     }
@@ -294,6 +319,7 @@ impl ClientProxy {
                 "window/showMessageRequest",
                 params,
                 cancel_token,
+                USER_ANSWERED_REQUEST_TIMEOUT,
             )
             .await?;
         serde_json::from_value(response.result?).ok()
@@ -307,10 +333,17 @@ impl ClientProxy {
         &self,
         params: ApplyWorkspaceEditParams,
         cancel_token: CancellationToken,
+        timeout: Duration,
     ) -> Option<ApplyWorkspaceEditResponse> {
         let request_id = self.next_id();
         let r = self
-            .send_request(request_id, "workspace/applyEdit", params, cancel_token)
+            .send_request(
+                request_id,
+                "workspace/applyEdit",
+                params,
+                cancel_token,
+                timeout,
+            )
             .await?;
         serde_json::from_value(r.result?).ok()
     }
@@ -359,6 +392,39 @@ mod tests {
         request
     }
 
+    #[gtest]
+    fn an_unanswered_request_times_out_and_cleans_up() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+        let id = client.next_id();
+
+        let response = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send_request(
+                    id,
+                    "workspace/configuration",
+                    lsp_types::ConfigurationParams { items: vec![] },
+                    tokio_util::sync::CancellationToken::new(),
+                    Duration::from_millis(50),
+                ),
+            )
+            .await
+            .expect("send_request must give up at its timeout, not hang")
+        });
+
+        verify_that!(response, none())?;
+        let request = recv_request(&peer);
+        verify_that!(request.method.as_str(), eq("workspace/configuration"))?;
+
+        let delivered = runtime.block_on(client.on_response(Response {
+            id: request.id,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+        verify_that!(delivered, none())
+    }
+
     /// A request made once its token is cancelled, as at shutdown, never
     /// reaches the client.
     #[gtest]
@@ -374,6 +440,7 @@ mod tests {
                 edit: lsp_types::WorkspaceEdit::default(),
             },
             cancelled,
+            Duration::from_millis(50),
         ));
 
         verify_that!(response, none())?;

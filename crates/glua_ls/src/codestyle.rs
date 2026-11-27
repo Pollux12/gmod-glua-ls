@@ -100,11 +100,20 @@ fn apply_generated_code_style(workspace_folders: &[WorkspaceFolder], emmyrc: &Em
         };
         let root_normalized = normalize_path(&root);
         let file_normalized = normalize_path(&path);
+        let _generated = GeneratedEditorConfigGuard(&path);
         update_code_style(&root_normalized, &file_normalized);
         applied_any = true;
     }
 
     applied_any
+}
+
+struct GeneratedEditorConfigGuard<'a>(&'a Path);
+
+impl Drop for GeneratedEditorConfigGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
 }
 
 fn build_style_map(emmyrc: &Emmyrc) -> BTreeMap<String, String> {
@@ -1134,5 +1143,56 @@ mod tests {
             guideline_titles_for(CfcGuidelineCoverageKind::NonFormatterPolicy).len(),
             24
         );
+    }
+
+    #[test]
+    fn generated_editorconfigs_do_not_leak_temp_files() {
+        let _guard = formatter_test_lock()
+            .lock()
+            .expect("formatter test mutex should not be poisoned");
+        let workspace_root = make_temp_workspace_root();
+        let workspace_root_normalized = normalize_path(&workspace_root);
+        fs::create_dir_all(&workspace_root).expect("should create temp formatter workspace");
+
+        let generated_dir = std::env::temp_dir()
+            .join("gluals")
+            .join("formatter")
+            .join("generated");
+        let pid = std::process::id().to_string();
+        let files_with_this_pid = || {
+            let mut names = match fs::read_dir(&generated_dir) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .filter(|name| {
+                        name.strip_suffix(".editorconfig")
+                            .and_then(|stem| stem.split('-').nth(1))
+                            .is_some_and(|component| component == pid)
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        };
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.format.preset = EmmyrcFormatPreset::Cfc;
+        emmyrc.format.config_precedence = EmmyrcFormatConfigPrecedence::PreferGluarc;
+
+        remove_code_style(&workspace_root_normalized);
+        let before = files_with_this_pid();
+        let workspaces = vec![WorkspaceFolder::new(workspace_root.clone(), false)];
+        assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
+        assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
+        let after = files_with_this_pid();
+
+        assert_eq!(
+            after, before,
+            "repeated apply_workspace_code_style calls must not leak generated temp files"
+        );
+
+        remove_code_style(&workspace_root_normalized);
+        let _ = fs::remove_dir_all(&workspace_root);
     }
 }

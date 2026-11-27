@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc::UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
+use super::schema_fetcher::SchemaFetcher;
 use super::{ClientProxy, FileDiagnostic};
 use crate::handlers::refresh_open_document_features;
 
@@ -114,6 +115,7 @@ pub struct DebouncedAnalysis {
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    schema_fetch: Option<Arc<SchemaFetcher>>,
     /// Re-diagnoses the files an edit's re-analysis reports as affected.
     file_diagnostic: Arc<FileDiagnostic>,
     debounce_duration: Duration,
@@ -224,6 +226,7 @@ impl DebouncedAnalysis {
         client: Arc<ClientProxy>,
         file_diagnostic: Arc<FileDiagnostic>,
         lsp_features: Arc<crate::context::LspFeatures>,
+        schema_fetch: Option<Arc<SchemaFetcher>>,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
@@ -248,6 +251,7 @@ impl DebouncedAnalysis {
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
+            schema_fetch,
             file_diagnostic,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
@@ -1028,6 +1032,36 @@ impl DebouncedAnalysis {
         refresh_open_document_features(&self.client, &self.lsp_features);
     }
 
+    /// Re-diagnoses the files a schema applied outside the edit loop moved.
+    pub async fn rediagnose_schema_affected(&self, affected: Vec<FileId>) {
+        if !affected.is_empty() {
+            self.refresh_affected(&[], affected).await;
+        }
+    }
+
+    /// Re-diagnoses what a background schema fetch changed, once its
+    /// re-analysis reports the files the newly resolved schemas moved.
+    pub async fn rediagnose_fetched_schemas(&self, mut applied: UnboundedReceiver<Vec<FileId>>) {
+        loop {
+            let received = tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                received = applied.recv() => received,
+            };
+            let Some(affected) = received else {
+                return;
+            };
+            self.rediagnose_schema_affected(affected).await;
+        }
+    }
+
+    /// Fetches pending schemas again without their backoff, off the caller's
+    /// path: a save may be what fixes a fetch that kept failing.
+    pub fn retry_schema_fetches(&self) {
+        if let Some(schema_fetch) = self.schema_fetch.as_ref() {
+            schema_fetch.retry_now();
+        }
+    }
+
     /// Background loop: waits for edits, debounces them, takes them into the
     /// re-analysis, then settles it in slices that release the analysis lock,
     /// so requests run between them. New edits pre-empt the slices and are
@@ -1187,6 +1221,9 @@ impl DebouncedAnalysis {
                     }
                     self.refresh_dirty_state().await;
                     crate::util::spawn_release_free_memory();
+                    if let Some(schema_fetch) = self.schema_fetch.as_ref() {
+                        schema_fetch.wake();
+                    }
                 }
                 // A didChange applied its text; its schedule pre-empts.
                 UpdateProgress::TextChanged => text_changed = true,
@@ -1296,6 +1333,7 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
+    use crate::context::diagnostic_store::Priority;
     use crate::context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar};
 
     use super::DebouncedAnalysis;
@@ -1333,6 +1371,7 @@ mod tests {
             client,
             file_diagnostic,
             test_lsp_features(),
+            None,
         ))
     }
 
@@ -1876,6 +1915,7 @@ mod tests {
                 client,
                 file_diagnostic.clone(),
                 test_lsp_features(),
+                None,
             ));
             file_diagnostic.store().start(1, debounced_analysis.clone());
 
@@ -1956,6 +1996,7 @@ mod tests {
             client,
             file_diagnostic.clone(),
             test_lsp_features(),
+            None,
         ));
         file_diagnostic.store().start(1, debounced_analysis.clone());
         (debounced_analysis, peer)
@@ -2096,6 +2137,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2165,6 +2207,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2252,6 +2295,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2333,6 +2377,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2665,6 +2710,7 @@ mod tests {
                 client,
                 file_diagnostic,
                 test_lsp_features(),
+                None,
             ));
             let loop_task = tokio::spawn({
                 let debounced_analysis = debounced_analysis.clone();
@@ -2776,6 +2822,30 @@ mod tests {
         })
     }
 
+    /// A schema the background fetch resolved re-diagnoses the files it moved,
+    /// without waiting for the next edit.
+    #[gtest]
+    fn a_resolved_schema_rediagnoses_the_files_it_moved() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let affected = FileId::new(1);
+            let (sender, applied) = tokio::sync::mpsc::unbounded_channel();
+            sender.send(vec![affected]).expect("the receiver is held");
+            drop(sender);
+
+            debounced_analysis.rediagnose_fetched_schemas(applied).await;
+
+            verify_that!(
+                debounced_analysis
+                    .file_diagnostic
+                    .store()
+                    .dirty_priority(affected),
+                some(eq(Priority::Closed))
+            )
+        })
+    }
+
     /// The client re-requests an edited document's own views, so only an edit
     /// that reached another open file refreshes them workspace-wide.
     #[gtest]
@@ -2808,6 +2878,7 @@ mod tests {
                 client,
                 file_diagnostic.clone(),
                 Arc::new(features),
+                None,
             );
             let (edited, closed, open) = (FileId::new(1), FileId::new(2), FileId::new(3));
             let store = file_diagnostic.store();

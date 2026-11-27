@@ -998,6 +998,7 @@ dependencies = [
  "smol_str",
  "tokio",
  "tokio-util",
+ "url",
  "walkdir",
  "wax",
 ]

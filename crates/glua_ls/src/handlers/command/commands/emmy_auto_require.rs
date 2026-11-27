@@ -5,7 +5,7 @@ use glua_parser::{LuaAstNode, LuaExpr, LuaStat};
 use lsp_types::{ApplyWorkspaceEditParams, Command, Position, TextEdit, WorkspaceEdit};
 use serde_json::Value;
 
-use crate::{context::ServerContextSnapshot, util::time_cancel_token};
+use crate::context::ServerContextSnapshot;
 
 use super::CommandSpec;
 
@@ -98,7 +98,6 @@ impl CommandSpec for AutoRequireCommand {
         let mut changes = HashMap::new();
         changes.insert(uri.clone(), vec![text_edit.clone()]);
 
-        let cancel_token = time_cancel_token(Duration::from_secs(5));
         let apply_edit_params = ApplyWorkspaceEditParams {
             label: None,
             edit: WorkspaceEdit {
@@ -112,7 +111,11 @@ impl CommandSpec for AutoRequireCommand {
         tokio::spawn(async move {
             let res = context_clone
                 .client()
-                .apply_edit(apply_edit_params, cancel_token)
+                .apply_edit(
+                    apply_edit_params,
+                    tokio_util::sync::CancellationToken::new(),
+                    Duration::from_secs(5),
+                )
                 .await;
             if let Some(res) = res
                 && !res.applied

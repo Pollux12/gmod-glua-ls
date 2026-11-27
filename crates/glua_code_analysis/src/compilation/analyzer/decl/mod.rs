@@ -2,7 +2,7 @@ mod docs;
 mod exprs;
 mod members;
 mod ops;
-mod stats;
+pub(crate) mod stats;
 
 use rustc_hash::FxHashSet;
 
