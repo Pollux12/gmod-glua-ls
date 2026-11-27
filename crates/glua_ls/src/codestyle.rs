@@ -100,9 +100,6 @@ fn apply_generated_code_style(workspace_folders: &[WorkspaceFolder], emmyrc: &Em
         };
         let root_normalized = normalize_path(&root);
         let file_normalized = normalize_path(&path);
-        // `update_code_style` reads and parses the file during the call, so
-        // nothing needs it on disk afterwards; the guard removes it however
-        // the iteration ends.
         let _generated = GeneratedEditorConfigGuard(&path);
         update_code_style(&root_normalized, &file_normalized);
         applied_any = true;
@@ -111,9 +108,6 @@ fn apply_generated_code_style(workspace_folders: &[WorkspaceFolder], emmyrc: &Em
     applied_any
 }
 
-/// Removes a generated `.editorconfig` when it goes out of scope, so
-/// repeated style applications do not leak temp files across reloads and
-/// sessions.
 struct GeneratedEditorConfigGuard<'a>(&'a Path);
 
 impl Drop for GeneratedEditorConfigGuard<'_> {
@@ -1151,8 +1145,6 @@ mod tests {
         );
     }
 
-    /// Repeated style applications leave no generated `.editorconfig`
-    /// behind: each temp file is removed once the formatter has read it.
     #[test]
     fn generated_editorconfigs_do_not_leak_temp_files() {
         let _guard = formatter_test_lock()
@@ -1162,10 +1154,6 @@ mod tests {
         let workspace_root_normalized = normalize_path(&workspace_root);
         fs::create_dir_all(&workspace_root).expect("should create temp formatter workspace");
 
-        // Generated names are `{hash}-{pid}-{timestamp}-{attempt}.editorconfig`:
-        // matching this process's exact pid component keeps other sessions'
-        // files out of the comparison, and sorting makes the listing order
-        // irrelevant.
         let generated_dir = std::env::temp_dir()
             .join("gluals")
             .join("formatter")
@@ -1195,8 +1183,6 @@ mod tests {
         remove_code_style(&workspace_root_normalized);
         let before = files_with_this_pid();
         let workspaces = vec![WorkspaceFolder::new(workspace_root.clone(), false)];
-        // Each apply must load the generated style: a failed write would
-        // otherwise make the leak check below pass vacuously.
         assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
         assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
         let after = files_with_this_pid();

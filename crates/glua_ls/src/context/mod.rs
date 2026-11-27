@@ -188,9 +188,6 @@ impl ServerContext {
             client.clone(),
         ));
         let debounced_shutdown = CancellationToken::new();
-        // Fetches the schemas an analysis round registers, so a
-        // `---@schema` tag an edit adds resolves without waiting for a
-        // save; only started with the other background tasks.
         let schema_fetch = background_tasks
             .then(|| SchemaFetcher::spawn(analysis.clone(), debounced_shutdown.clone()));
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(

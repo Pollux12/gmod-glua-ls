@@ -12,35 +12,9 @@ use lsp_types::{
 
 use crate::context::EditorDocuments;
 
-/// Messages that arrived while the workspace was still initializing, held
-/// until initialization completes.
-///
-/// Editor notification bursts are coalesced per document so the queue stays
-/// bounded: with incremental sync a keystroke burst is one `didChange` per
-/// keystroke, and folding each document's queued changes into one full-text
-/// change keeps the queue at a few entries per open document instead of one
-/// entry per keystroke. A `didClose` supersedes the `didOpen` and
-/// `didChange` notifications queued before it for the same document - and,
-/// within the rewrite window, the closes before it, so an open/close
-/// churn loop cannot grow the queue either - and a run of `didSave`
-/// notifications keeps only the last.
-///
-/// Only the trailing run of document notifications is ever rewritten: every
-/// message before the last queued request stays exactly as the client sent
-/// it, so a request deferred behind initialization still observes the
-/// document state it was made against.
 pub(super) struct PendingInitQueue {
     messages: Vec<Message>,
-    /// The folded text of each document the queue holds notifications for:
-    /// the `didOpen` text with every queued `didChange` applied, the same
-    /// way the replayed notifications will update the editor's documents.
     documents: EditorDocuments,
-    /// Documents whose queued `didChange` notifications include one the
-    /// fold could not take. That raw notification stays in the queue, so
-    /// the next successful fold starts a new chain appended after it
-    /// instead of rewriting the change queued before the failure: replay
-    /// must apply the rejected change before the full-text change that
-    /// recovered from it, or it ends out of sync again.
     fold_boundaries: HashSet<Uri>,
 }
 
@@ -53,8 +27,6 @@ impl PendingInitQueue {
         }
     }
 
-    /// Defers `msg` until initialization completes, coalescing document
-    /// notification bursts per document.
     pub(super) fn queue(&mut self, msg: Message) {
         let Message::Notification(notification) = msg else {
             self.messages.push(msg);
@@ -91,10 +63,6 @@ impl PendingInitQueue {
                     Ok(text) => {
                         let folded = folded_change(&uri, version, text);
                         let mut tail = self.messages.split_off(window);
-                        // A change that could not fold broke this document's
-                        // chain: the raw notification stayed in the queue,
-                        // so this fold starts a new chain appended after it
-                        // rather than rewriting the one before the failure.
                         let chain_broken = self.fold_boundaries.remove(&uri);
                         let folded_position = if chain_broken {
                             None
@@ -112,10 +80,6 @@ impl PendingInitQueue {
                         }
                         self.messages.append(&mut tail);
                     }
-                    // Nothing to fold against: no `didOpen` was ever queued,
-                    // or a change the editor text could not take. Keep the
-                    // notification as the client sent it, and mark the
-                    // chain broken for the next change that folds.
                     Err(_) => {
                         self.fold_boundaries.insert(uri);
                         self.messages.push(Message::Notification(notification));
@@ -158,9 +122,6 @@ impl PendingInitQueue {
                         )
                     });
                 match last_save {
-                    // A run of saves keeps only the last one: a save carries
-                    // no edits, and the workspace recheck it schedules is
-                    // idempotent while it is still delayed.
                     Some(position) => tail[position] = Message::Notification(notification),
                     None => tail.push(Message::Notification(notification)),
                 }
@@ -170,15 +131,12 @@ impl PendingInitQueue {
         }
     }
 
-    /// Takes every queued message, resetting the per-document fold state.
     pub(super) fn take(&mut self) -> Vec<Message> {
         self.documents = EditorDocuments::default();
         self.fold_boundaries.clear();
         std::mem::take(&mut self.messages)
     }
 
-    /// Where the trailing run of queued document notifications starts: only
-    /// this run may be rewritten, since no queued request observes it.
     fn document_window_start(&self) -> usize {
         let mut start = self.messages.len();
         while start > 0 && queued_doc(&self.messages[start - 1]).is_some() {
@@ -187,13 +145,6 @@ impl PendingInitQueue {
         start
     }
 
-    /// Removes the window's queued document notifications for `uri`.
-    ///
-    /// `didOpen` and `didChange` entries always go: a close or a reopen
-    /// supersedes them. A `didClose` before them stays for a reopen - it
-    /// still runs for its own side effects - but a later close drops it,
-    /// so an open/close churn loop cannot grow the window; a `didSave`'s
-    /// workspace recheck is superseded by neither.
     fn remove_document_entries(&mut self, window: usize, uri: &Uri, include_closes: bool) {
         let uri = uri.as_str();
         let tail = self.messages.split_off(window);
@@ -210,9 +161,6 @@ impl PendingInitQueue {
     }
 }
 
-/// One full-text `didChange` standing in for every queued change to `uri`:
-/// replaying it applies the same text the queued incremental changes would
-/// have, without depending on the ranges of the edits before it.
 fn folded_change(uri: &Uri, version: i32, text: String) -> Message {
     let params = DidChangeTextDocumentParams {
         text_document: VersionedTextDocumentIdentifier {
@@ -231,9 +179,6 @@ fn folded_change(uri: &Uri, version: i32, text: String) -> Message {
     ))
 }
 
-/// The method and URI of a queued document notification, without
-/// deserializing its params: a folded `didChange` holds the document's full
-/// text, which no scan needs to copy.
 fn queued_doc(msg: &Message) -> Option<(&'static str, &str)> {
     let Message::Notification(notification) = msg else {
         return None;
@@ -285,8 +230,6 @@ mod tests {
         ))
     }
 
-    /// One incremental change replacing `range` with `text`, as an editor
-    /// sends with `TextDocumentSyncKind::INCREMENTAL`.
     fn change(
         version: i32,
         range: Option<(u32, u32, u32, u32)>,
@@ -351,8 +294,6 @@ mod tests {
         notification.method.clone()
     }
 
-    /// A burst of incremental changes during initialization folds into one
-    /// full-text change carrying the text the whole burst produced.
     #[test]
     fn a_change_burst_folds_into_one_full_text_change() {
         let mut queue = PendingInitQueue::new();
@@ -371,8 +312,6 @@ mod tests {
         );
     }
 
-    /// Incremental changes keep applying to the text of the edits before
-    /// them, exactly as the editor applied them.
     #[test]
     fn folded_changes_preserve_incremental_edits() {
         let mut queue = PendingInitQueue::new();
@@ -388,8 +327,6 @@ mod tests {
         );
     }
 
-    /// A didClose supersedes the didOpen and didChange notifications queued
-    /// before it for the same document.
     #[test]
     fn a_close_supersedes_queued_edits() {
         let mut queue = PendingInitQueue::new();
@@ -409,8 +346,6 @@ mod tests {
         );
     }
 
-    /// A didOpen replaces the document's prior queued edits, as a reopen
-    /// restarts the document's state.
     #[test]
     fn a_reopen_replaces_prior_queued_edits() {
         let mut queue = PendingInitQueue::new();
@@ -425,7 +360,6 @@ mod tests {
             "only the reopening didOpen remains"
         );
 
-        // The new session's edits fold from the new open text.
         queue.queue(open(1, "local reopened = true\n"));
         queue.queue(change(2, Some((0, 6, 0, 7)), "b"));
         assert_eq!(
@@ -434,7 +368,6 @@ mod tests {
         );
     }
 
-    /// A run of saves keeps only the last one.
     #[test]
     fn a_run_of_saves_keeps_only_the_last() {
         let mut queue = PendingInitQueue::new();
@@ -449,9 +382,6 @@ mod tests {
         );
     }
 
-    /// Every message before the last queued request stays exactly as the
-    /// client sent it, so the request observes the state it was made
-    /// against; only the trailing run is rewritten.
     #[test]
     fn a_request_pins_the_edits_queued_before_it() {
         let mut first = PendingInitQueue::new();
@@ -485,8 +415,6 @@ mod tests {
         );
     }
 
-    /// A notification that is not a document notification ends the
-    /// rewriteable run.
     #[test]
     fn a_non_document_notification_pins_the_run_before_it() {
         let mut queue = PendingInitQueue::new();
@@ -506,8 +434,6 @@ mod tests {
         );
     }
 
-    /// A didChange the editor text cannot take (no didOpen was queued for
-    /// the document) is kept exactly as the client sent it.
     #[test]
     fn an_unfoldable_change_is_kept_as_sent() {
         let mut queue = PendingInitQueue::new();
@@ -521,10 +447,6 @@ mod tests {
         );
     }
 
-    /// A full-text change recovers a document a rejected change left out of
-    /// sync: the recovered fold starts a new chain after the raw change, so
-    /// replay applies the rejection and then the resync, ending in sync with
-    /// the editor's text.
     #[test]
     fn a_full_text_resync_after_a_rejected_change_replays_in_sync() {
         let mut queue = PendingInitQueue::new();
@@ -545,8 +467,6 @@ mod tests {
             "the rejected change stays queued, with the recovered fold after it"
         );
 
-        // Replay as the real handlers do: each didChange applies to the
-        // editor's documents, a rejected one is reported and skipped.
         let mut replayed = crate::context::EditorDocuments::default();
         replayed.open(uri(), "local a = 1\n".to_string());
         for msg in &messages {
@@ -560,9 +480,6 @@ mod tests {
             }
         }
 
-        // An empty change returns the current text, and fails when the
-        // document is out of sync: the replay must end in sync, at the
-        // resyncing change's text.
         assert_eq!(
             replayed.change(&uri(), Vec::new()),
             Ok("local fixed\n".to_string()),
@@ -570,8 +487,6 @@ mod tests {
         );
     }
 
-    /// An open/close churn loop for one document leaves the rewrite window
-    /// at one close (and at most one open), not one entry per cycle.
     #[test]
     fn open_close_cycles_keep_the_window_bounded() {
         let mut queue = PendingInitQueue::new();

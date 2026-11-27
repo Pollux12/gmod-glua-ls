@@ -49,9 +49,6 @@ enum RefreshRequestKind {
     CodeLens,
 }
 
-/// How long to wait for a response the user answers in their own time,
-/// such as `window/showMessageRequest` and `workspace/applyEdit`: the
-/// prompt can sit on screen for minutes, but not forever.
 pub(crate) const USER_ANSWERED_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl RefreshRequestKind {
@@ -100,14 +97,6 @@ impl ClientProxy {
         }));
     }
 
-    /// Sends a request and waits for its response, `cancel_token`, or
-    /// `timeout`, whichever comes first; a request whose token is already
-    /// cancelled is never sent. A request left unanswered until the timeout
-    /// is given up on: its response sender is unparked, so a late response
-    /// finds nothing to deliver to and a client that never answers cannot
-    /// leak the awaiting task. A request that cannot be sent at all — the
-    /// client is gone — is given up on the same way, without waiting out
-    /// the timeout.
     pub async fn send_request(
         &self,
         id: RequestId,
@@ -403,16 +392,12 @@ mod tests {
         request
     }
 
-    /// A request the client never answers is given up on at its timeout, and
-    /// the late response then finds no parked sender to deliver to.
     #[gtest]
     fn an_unanswered_request_times_out_and_cleans_up() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (client, peer) = create_client_proxy();
         let id = client.next_id();
 
-        // The wrapper's own deadline turns a timeout regression into a
-        // failed test instead of a hung one.
         let response = runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -437,8 +422,6 @@ mod tests {
             result: Some(serde_json::Value::Null),
             error: None,
         }));
-        // `None` is the proof the timed-out request no longer parks a
-        // response sender for a late response to deliver to.
         verify_that!(delivered, none())
     }
 

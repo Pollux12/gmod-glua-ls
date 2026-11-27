@@ -134,14 +134,10 @@ pub fn call_expr_is_net_op(
     db_index::signature_has_net_op_metadata(db, signature_id)
 }
 
-/// How long one schema URL may take to fetch, so an unreachable URL cannot
-/// stall the startup or the save that triggered the recheck.
 const SCHEMA_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
     let mut url_contents = HashMap::default();
-    // The client's timeout bounds every fetch, from connecting through
-    // reading the response body.
     let client = match reqwest::Client::builder()
         .timeout(SCHEMA_FETCH_TIMEOUT)
         .build()
@@ -1076,8 +1072,6 @@ impl EmmyLuaAnalysis {
             }
         }
 
-        // Their tags bound nothing while the schema was unresolved. URLs
-        // that did not resolve stay `NeedResolve` for a later retry.
         if !users.is_empty() {
             self.reindex_files(users);
         }

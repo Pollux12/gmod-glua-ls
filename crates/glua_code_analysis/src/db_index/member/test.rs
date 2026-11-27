@@ -913,8 +913,6 @@ mod tests {
         assert_eq!(owner_member_ids(&index, &owner), vec![first_id, second_id]);
     }
 
-    /// Files two guarded self-assignment writers into one slot of `index`,
-    /// in the production order (added first, then marked).
     fn fill_reconciled_co_writers(
         index: &mut LuaMemberIndex,
         owner: &LuaMemberOwner,
@@ -932,7 +930,6 @@ mod tests {
         }
     }
 
-    /// A fresh index holding two reconciled co-writers in one slot.
     fn index_with_reconciled_co_writers(
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
@@ -943,9 +940,6 @@ mod tests {
         index
     }
 
-    /// A reconciled slot's mark drops with the last member of the slot, so
-    /// file create/delete churn cannot retain it without bound. A slot
-    /// that still holds a member keeps its mark.
     #[test]
     fn a_reconciled_slot_mark_drops_with_its_last_member() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
@@ -975,10 +969,6 @@ mod tests {
         );
     }
 
-    /// A slot emptied by removal and re-created by later analysis into the
-    /// same index still readmits its co-writers: the members share one
-    /// lookup item and the fresh mark is re-derived, with no stale entry
-    /// left to skip it.
     #[test]
     fn a_recreated_slot_still_readmits_its_co_writers() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
@@ -997,8 +987,6 @@ mod tests {
                 .is_empty()
         );
 
-        // Re-analysis of both files re-adds the same members and marks
-        // them, into the same index the removals emptied.
         fill_reconciled_co_writers(&mut index, &owner, &key, ids);
         assert_eq!(owner_member_ids(&index, &owner), ids.to_vec());
         assert!(
@@ -1009,9 +997,6 @@ mod tests {
         );
     }
 
-    /// A member that moved owners leaves its history behind under the old
-    /// one; the file-removal sweep that clears that history empties the
-    /// old slot, and its reconciled mark goes with it.
     #[test]
     fn a_sweep_emptied_slot_drops_its_reconciled_mark() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
@@ -1041,8 +1026,6 @@ mod tests {
         );
     }
 
-    /// Rekeying a marked member away from its key empties the old key's
-    /// slot, and its reconciled mark goes with it.
     #[test]
     fn a_rekey_emptied_slot_drops_its_reconciled_mark() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));

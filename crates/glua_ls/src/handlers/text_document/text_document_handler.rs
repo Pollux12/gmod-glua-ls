@@ -97,11 +97,6 @@ async fn apply_document_update_without_queuing(
     outcome
 }
 
-/// Re-fetches the JSON schemas a save can now resolve.
-///
-/// A save is the retry point for schema URLs that a previous fetch left
-/// unresolved; the first attempt for newly registered URLs happens in the
-/// background when an analysis round settles.
 async fn check_schema_update(context: &ServerContextSnapshot) {
     let urls = {
         let read_analysis = context.analysis().read().await;
@@ -118,8 +113,6 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
 
     let url_contents = fetch_schema_urls(urls).await;
     if url_contents.is_empty() {
-        // Nothing resolved; applying would only take the write lock to do
-        // nothing, and the pending URLs stay queued for the next recheck.
         return;
     }
 
@@ -234,9 +227,6 @@ pub async fn on_did_save_text_document(
         workspace.recheck_workspace(delay, context.clone()).await;
     }
 
-    // The retry point for schema URLs an edit registered: the fetcher's
-    // settled-round attempt may have failed, and a save can also create
-    // the missing file a `file://` URL names.
     check_schema_update(&context).await;
     Some(())
 }
@@ -816,9 +806,6 @@ mod tests {
     const SCHEMA_JSON: &str =
         r#"{"title":"Cfg","type":"object","properties":{"port":{"type":"integer"}}}"#;
 
-    /// A context whose temp folder is the main workspace, so documents
-    /// opened in it register their `---@schema` tags, with the folder
-    /// holding `doc.lua` indexed from its disk text.
     async fn context_with_main_workspace(name: &str) -> (ServerContext, Connection, Uri, TempDir) {
         let (connection, peer) = Connection::memory();
         let context = ServerContext::new(connection, ClientCapabilities::default());
@@ -836,8 +823,6 @@ mod tests {
         (context, peer, doc_uri, folder)
     }
 
-    /// Polls `read` every 50 ms until it returns `Some`, or `timeout`
-    /// elapses.
     async fn eventually<T, P>(timeout: Duration, mut read: impl FnMut() -> P) -> Option<T>
     where
         P: Future<Output = Option<T>>,
@@ -854,7 +839,6 @@ mod tests {
         }
     }
 
-    /// Whether the schema index holds `url` pending resolution.
     async fn schema_is_pending(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
         let analysis = snapshot.analysis().read().await;
         matches!(
@@ -867,7 +851,6 @@ mod tests {
         )
     }
 
-    /// Whether the schema index holds `url` resolved.
     async fn schema_is_resolved(snapshot: &ServerContextSnapshot, url: &Url) -> bool {
         let analysis = snapshot.analysis().read().await;
         matches!(
@@ -880,8 +863,6 @@ mod tests {
         )
     }
 
-    /// A `---@schema` tag an edit registers resolves through the fetch a
-    /// settled analysis round wakes, without any save from the client.
     #[gtest]
     fn an_edited_schema_tag_resolves_without_a_save() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -916,9 +897,6 @@ mod tests {
         })
     }
 
-    /// The settled round resolves the fetchable half of a mixed batch and
-    /// leaves the missing file's URL pending — not retired — so the save
-    /// that follows the file's creation resolves it.
     #[gtest]
     fn a_missing_schema_file_resolves_on_the_save_after_its_creation() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");

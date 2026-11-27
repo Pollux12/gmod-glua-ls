@@ -43,9 +43,6 @@ impl ServerMessageProcessor {
         }
     }
 
-    /// Defers a message the server cannot process during initialization,
-    /// coalescing editor notification bursts so the queue stays bounded
-    /// while the workspace loads.
     pub(super) fn queue_during_init(&mut self, msg: Message) {
         self.pending.queue(msg);
     }

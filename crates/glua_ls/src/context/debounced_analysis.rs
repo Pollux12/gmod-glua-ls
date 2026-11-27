@@ -115,8 +115,6 @@ pub struct DebouncedAnalysis {
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    /// Fetches the JSON schemas a settled round registered; `None` without
-    /// background tasks, as in tests.
     schema_fetch: Option<Arc<SchemaFetcher>>,
     /// Re-diagnoses the files an edit's re-analysis reports as affected.
     file_diagnostic: Arc<FileDiagnostic>,
@@ -1193,9 +1191,6 @@ impl DebouncedAnalysis {
                     }
                     self.refresh_dirty_state().await;
                     crate::util::spawn_release_free_memory();
-                    // A settled round is when a newly registered `---@schema`
-                    // URL becomes visible; the fetcher resolves it in the
-                    // background without holding the analysis lock.
                     if let Some(schema_fetch) = self.schema_fetch.as_ref() {
                         schema_fetch.wake();
                     }

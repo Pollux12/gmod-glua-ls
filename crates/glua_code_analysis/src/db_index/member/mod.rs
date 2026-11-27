@@ -255,16 +255,6 @@ pub struct LuaMemberIndex {
     expr_key_members_by_file: CowShards<FileId, HashSet<LuaMemberId>>,
     non_overwriting_assignment_members: CowShardSet<LuaMemberId>,
     /// `(owner, key)` slots whose last co-writer readmission merged nothing.
-    ///
-    /// See [`Self::readmit_preserved_assignment_co_writers`]: every later
-    /// scan of such a slot is a proven no-op, so marks skip the walk. Every
-    /// mutation except removal preserves the coverage an entry records, and
-    /// any future history write without a paired item merge must clear its
-    /// slot here. A removal that empties a slot drops its entry with the
-    /// slot, wherever the slot's history entries are removed
-    /// ([`Self::prune_reconciled_slot`]); a re-created slot re-derives its
-    /// coverage on the next mark, so an entry never outlives the slot it
-    /// describes.
     preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
@@ -1701,10 +1691,6 @@ impl LuaMemberIndex {
             self.fold_history_fingerprint(owner, history_element(&key, id), false);
             note_slot_write(owner, &key);
         }
-        // This is where a member's history entries leave its slot, on every
-        // path that removes them: forgetting the member, rekeying it away
-        // from this key, and resetting its filings. The slot can empty here,
-        // so the reconciled mark goes with it.
         self.prune_reconciled_slot(owner, &key);
     }
 
@@ -1739,9 +1725,6 @@ impl LuaMemberIndex {
                 if seen.insert((owner.clone(), key.clone(), id)) {
                     note_slot_write(&owner, &key);
                     self.fold_history_fingerprint(&owner, history_element(&key, id), false);
-                    // A swept entry can be the last in its slot - one left
-                    // behind by a member that moved owners, which no
-                    // forget prunes - so the reconciled mark goes with it.
                     self.prune_reconciled_slot(&owner, &key);
                 }
             }
@@ -2934,10 +2917,7 @@ impl LuaMemberIndex {
     /// and `set_member_owner` only through those callers), every removal
     /// touches both sides for the same id, and marking only ever covers an
     /// already-listed member. Any future history write without a paired item
-    /// merge must clear that slot's entry. A removal that empties the slot
-    /// drops its entry, wherever the slot's history entries are removed
-    /// ([`Self::prune_reconciled_slot`]): the coverage it recorded left with
-    /// the members, and a re-created slot is marked fresh.
+    /// merge must clear that slot's entry.
     ///
     /// Exception: [`Self::set_member_owner_only`] calls `set_member_owner`
     /// without an item merge (see the `set_member_owner_only` body), filing a
@@ -3258,15 +3238,6 @@ impl LuaMemberIndex {
         }
     }
 
-    /// Drops the reconciled-slot mark of `(owner, key)` once neither
-    /// owner-key index holds a member for the slot any more, so marks never
-    /// outlive the slots they describe under file create/delete churn.
-    ///
-    /// The mark records that a full readmission scan of the slot merged
-    /// nothing; an empty slot's scan cannot merge anything either, so
-    /// dropping it changes no answer. A slot re-created by later analysis
-    /// re-derives its coverage on the next mark, without a stale entry
-    /// there to skip it.
     fn prune_reconciled_slot(&mut self, owner: &LuaMemberOwner, key: &LuaMemberKey) {
         let slot_is_empty = |index: &OwnerKeyMap| {
             index
@@ -3654,8 +3625,6 @@ impl LuaMemberIndex {
                     note_slot_write(&owner, key);
                 }
             }
-            // The owner's slots went wholesale, so the reconciled marks
-            // they still hold go with them.
             for key in visible
                 .iter()
                 .chain(displaced.iter())

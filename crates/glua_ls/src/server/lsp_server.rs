@@ -154,19 +154,11 @@ impl LspServer {
                             Message::Request(request)
                                 if should_fail_fast_request_during_init(&request.method) =>
                             {
-                                // During startup, fail fast for editor data requests instead
-                                // of queueing them behind full workspace initialization.
-                                // Clients will re-request after initialization and avoid
-                                // perceived 10-20s startup request stalls.
                                 let response = self
                                     .server_context
                                     .refused_during_init(request.id, &request.method);
                                 self.connection.send(response.into())?;
                             }
-                            // Everything else is deferred until initialization
-                            // completes; the queue coalesces editor notification
-                            // bursts so a long initialization cannot grow it
-                            // without bound.
                             msg => self.processor.queue_during_init(msg),
                         }
                     }
