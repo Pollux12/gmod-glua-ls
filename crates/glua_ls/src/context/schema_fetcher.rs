@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glua_code_analysis::{EmmyLuaAnalysis, FileId, Url, fetch_schema_urls};
+use glua_code_analysis::{
+    EmmyLuaAnalysis, FileId, Url, convert_fetched_schemas, fetch_schema_urls,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -97,9 +99,10 @@ async fn worker(
         if url_contents.is_empty() {
             continue;
         }
+        let converted = convert_fetched_schemas(url_contents);
         let applied = {
             let mut write_analysis = analysis.write().await;
-            write_analysis.apply_fetched_schemas(url_contents)
+            write_analysis.apply_fetched_schemas(converted)
         };
         attempts.resolved(&applied.resolved);
         if !applied.affected.is_empty() {

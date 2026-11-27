@@ -1,5 +1,6 @@
 use glua_code_analysis::{
-    DeferredVfsDrop, Emmyrc, FileId, fetch_schema_urls, read_file_with_encoding, uri_to_file_path,
+    DeferredVfsDrop, Emmyrc, FileId, convert_fetched_schemas, fetch_schema_urls,
+    read_file_with_encoding, uri_to_file_path,
 };
 use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 use lsp_types::{
@@ -115,9 +116,10 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
     if url_contents.is_empty() {
         return;
     }
+    let converted = convert_fetched_schemas(url_contents);
 
     let mut write_analysis = context.analysis().write().await;
-    let applied = write_analysis.apply_fetched_schemas(url_contents);
+    let applied = write_analysis.apply_fetched_schemas(converted);
     drop(write_analysis);
     context
         .debounced_analysis()

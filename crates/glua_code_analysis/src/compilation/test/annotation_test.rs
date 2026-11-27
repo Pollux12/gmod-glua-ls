@@ -4,7 +4,7 @@ mod test {
 
     use crate::{
         DiagnosticCode, FileId, LuaDocDefaultValue, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-        LuaTypeDeclId, VirtualWorkspace,
+        LuaTypeDeclId, VirtualWorkspace, convert_fetched_schemas,
     };
 
     fn index_expr_ty(ws: &VirtualWorkspace, file_id: FileId, expr_text: &str) -> LuaType {
@@ -1569,8 +1569,9 @@ local value = receiver.value
         let schema =
             r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
 
-        ws.analysis
-            .apply_fetched_schemas(std::collections::HashMap::from([(url, schema.to_string())]));
+        ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url, schema.to_string())]),
+        ));
 
         let typ = ws.local_ty(file_id, "config");
         assert!(matches!(typ, LuaType::Ref(_)), "{typ:?}");
@@ -1589,12 +1590,9 @@ local value = receiver.value
         let schema =
             r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
 
-        let applied = ws
-            .analysis
-            .apply_fetched_schemas(std::collections::HashMap::from([(
-                url.clone(),
-                schema.to_string(),
-            )]));
+        let applied = ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url.clone(), schema.to_string())]),
+        ));
 
         assert_eq!(applied.resolved, vec![url]);
         assert!(
@@ -1615,9 +1613,9 @@ local value = receiver.value
         );
         let url = url::Url::parse("https://example.com/config.json").expect("a URL");
 
-        let applied = ws
-            .analysis
-            .apply_fetched_schemas(std::collections::HashMap::from([(url, "{".to_string())]));
+        let applied = ws.analysis.apply_fetched_schemas(convert_fetched_schemas(
+            std::collections::HashMap::from([(url, "{".to_string())]),
+        ));
 
         assert!(applied.resolved.is_empty());
         assert!(applied.affected.is_empty(), "{:?}", applied.affected);

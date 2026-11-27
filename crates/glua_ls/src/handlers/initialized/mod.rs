@@ -23,7 +23,8 @@ use crate::{
 pub use client_config::{ClientConfig, client_config_sections, get_client_config};
 use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, FileId, Slice, WorkspaceFolder, calculate_include_and_exclude,
-    collect_workspace_files, fetch_schema_urls, file_path_to_uri, uri_to_file_path,
+    collect_workspace_files, convert_fetched_schemas, fetch_schema_urls, file_path_to_uri,
+    uri_to_file_path,
 };
 use lsp_types::{InitializeParams, MessageType, ShowMessageParams, Uri};
 use tokio::sync::RwLock;
@@ -395,8 +396,9 @@ pub async fn init_analysis(
         );
         log::info!("fetching {} JSON schemas", schema_urls.len());
         let url_contents = fetch_schema_urls(schema_urls).await;
+        let converted = convert_fetched_schemas(url_contents);
         let mut mut_analysis = analysis.write().await;
-        mut_analysis.apply_fetched_schemas(url_contents);
+        mut_analysis.apply_fetched_schemas(converted);
         watchdog_status.set_phase("JSON schema fetch/apply complete");
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
