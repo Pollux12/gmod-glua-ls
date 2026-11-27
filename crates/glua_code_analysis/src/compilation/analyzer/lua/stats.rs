@@ -2488,14 +2488,14 @@ fn bind_table_field_value_type(
     // Binding the field literal instead leaves whichever file re-walked
     // last in the cache, and reads taken between the writes disagree with
     // the settled answer.
-    let value_type = if is_guarded_table_assignment_member(&analyzer.db, member_id) {
-        canonical_guarded_table_bootstrap_type(&analyzer.db, member_id).unwrap_or(value_type)
-    } else {
-        value_type
-    };
-    analyzer.write(StatementWrite::BindType {
-        owner: member_id.into(),
-        cache: LuaTypeCache::InferType(value_type),
+    let dynamic_key = field
+        .get_field_key()
+        .is_some_and(|key| matches!(key, LuaIndexKey::Expr(_)));
+    analyzer.write(StatementWrite::AssignMember {
+        member_id,
+        value: value_type,
+        dynamic_key,
+        preserve_table_literals: false,
     });
     Some(())
 }

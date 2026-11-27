@@ -442,11 +442,18 @@ pub fn try_resolve_member(
         let member_id = unresolve_member.member_id;
         let type_owner: crate::LuaTypeOwner = member_id.into();
         writes.push(move |db, _| {
-            bind_resolved_type(
+            let allow_widening =
+                !crate::compilation::analyzer::lua::is_guarded_table_assignment_member(
+                    db, member_id,
+                );
+            let value = crate::compilation::analyzer::lua::record_and_widen_member_collection(
                 db,
-                type_owner.clone(),
-                LuaTypeCache::InferType(expr_type.clone()),
-            );
+                member_id,
+                &expr_type,
+                allow_widening,
+            )
+            .unwrap_or_else(|| expr_type.clone());
+            bind_resolved_type(db, type_owner.clone(), LuaTypeCache::InferType(value));
         });
         writes.push(move |db, _| {
             crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);

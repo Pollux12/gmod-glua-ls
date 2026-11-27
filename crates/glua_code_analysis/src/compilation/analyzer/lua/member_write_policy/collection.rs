@@ -13,22 +13,63 @@ use glua_parser::{
 
 use super::super::{LuaAnalyzer, stats::is_local_mutable};
 
-/// The collection type `member_id` holds once `incoming` joins the collections
-/// the other members of its slot in its own file hold, when any of them holds
-/// one. Another file's member of the slot is its own write: taking it in would
-/// make two files' members each widen with the other's and settle together.
-pub(in crate::compilation::analyzer) fn widened_member_assignment_collection_type(
-    db: &DbIndex,
+/// Records `member_id`'s raw inferred collection element base (or clears it
+/// when this write is not a non-dynamic inferred collection) and returns the
+/// widened collection type once `incoming` joins the raw collections of its
+/// slot's other realm-compatible members in the same file, if any.
+///
+/// Sibling members read each other's raw assigned bases (`MemberCollection`)
+/// rather than their already-widened `TypeCache`s so sibling writers never
+/// form a feedback loop that traps transient element types (e.g. a nullable
+/// append before its guard settles).
+pub(in crate::compilation::analyzer) fn record_and_widen_member_collection(
+    db: &mut DbIndex,
     member_id: LuaMemberId,
     incoming: &LuaType,
+    allow_widening: bool,
 ) -> Option<LuaType> {
-    let incoming_array = normalize_infer_collection_type(db, incoming)?;
+    let incoming_array = allow_widening
+        .then(|| normalize_infer_collection_type(db, incoming))
+        .flatten();
+    let Some(incoming_array) = incoming_array else {
+        db.get_type_index_mut()
+            .set_member_collection_base(member_id, None);
+        return None;
+    };
+    let slot = {
+        let member_index = db.get_member_index();
+        member_index
+            .get_member(&member_id)
+            .and_then(|member| {
+                let key = member.get_key();
+                (!key.is_expr()).then(|| key.clone())
+            })
+            .and_then(|key| {
+                let owner = member_index.get_member_owner(&member_id)?.clone();
+                Some((owner, key))
+            })
+    };
+    let Some((owner, key)) = slot else {
+        db.get_type_index_mut()
+            .set_member_collection_base(member_id, None);
+        return None;
+    };
+    let raw_base = incoming_array.get_base().clone();
+    db.get_type_index_mut()
+        .set_member_collection_base(member_id, Some(raw_base.clone()));
+    widened_member_assignment_collection_type(db, member_id, &owner, &key, raw_base)
+}
+
+fn widened_member_assignment_collection_type(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    mut widened_base: LuaType,
+) -> Option<LuaType> {
     let member_index = db.get_member_index();
-    let owner = member_index.get_member_owner(&member_id)?.clone();
-    let key = member_index.get_member(&member_id)?.get_key().clone();
-    let mut widened_base = incoming_array.get_base().clone();
     let mut saw_related_collection = false;
-    for related_member in member_index.get_members_for_owner_key(&owner, &key) {
+    for related_member in member_index.get_members_for_owner_key(owner, key) {
         let related_member_id = related_member.get_id();
         if related_member_id == member_id
             || related_member_id.file_id != member_id.file_id
@@ -36,22 +77,15 @@ pub(in crate::compilation::analyzer) fn widened_member_assignment_collection_typ
         {
             continue;
         }
-        let Some(existing_cache) = db
+        let Some(existing_base) = db
             .get_type_index()
-            .get_type_cache(&related_member_id.into())
+            .member_collection_base(&related_member_id)
             .cloned()
         else {
             continue;
         };
-        if !existing_cache.is_infer() {
-            continue;
-        }
-        let Some(existing_array) = normalize_infer_collection_type(db, existing_cache.as_type())
-        else {
-            continue;
-        };
         saw_related_collection = true;
-        widened_base = TypeOps::Union.apply(db, existing_array.get_base(), &widened_base);
+        widened_base = TypeOps::Union.apply(db, &existing_base, &widened_base);
     }
 
     saw_related_collection
@@ -93,35 +127,11 @@ pub(in crate::compilation::analyzer::lua) fn widen_existing_member_collection_ty
         return Some(());
     };
 
-    let is_collection_append = is_collection_append_write(index_expr).unwrap_or(false);
-    let incoming_is_collection =
-        normalize_infer_collection_type(&analyzer.db, value_type).is_some();
-
-    if !incoming_is_collection && !is_collection_append {
+    if !is_collection_append_write(index_expr).unwrap_or(false) {
         return Some(());
     }
 
-    // A value stored under a key that varies at runtime is one of the table's
-    // elements, not a collection its other writers reset: another row is no
-    // evidence this one is a list. Only an append into it is.
-    let dynamic_key =
-        incoming_is_collection && dynamic_key_owner_and_member_key(analyzer, index_expr).is_some();
-    if incoming_is_collection
-        && !dynamic_key
-        && let Some(mut member_ids) = find_related_member_ids(analyzer, index_expr.clone())
-    {
-        // The written member holds this value, not a collection it joins.
-        // Another file's member takes this one in when its own write reads
-        // the slot, so widening it here would only make that file's facts
-        // depend on this statement.
-        let written = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
-        member_ids
-            .retain(|member_id| *member_id != written && member_id.file_id == analyzer.file_id);
-        widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
-    }
-
-    if is_collection_append
-        && let Some(prefix_expr) = index_expr.get_prefix_expr()
+    if let Some(prefix_expr) = index_expr.get_prefix_expr()
         && let Some(prefix_index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
     {
         let deferred_element_widening =
@@ -551,21 +561,6 @@ pub(in crate::compilation::analyzer::lua) fn is_literal_integer_one(expr: &LuaEx
     )
 }
 
-pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_collection_type(
-    analyzer: &mut LuaAnalyzer,
-    member_ids: &[LuaMemberId],
-    incoming_type: &LuaType,
-) -> Option<()> {
-    if member_ids.is_empty() {
-        return Some(());
-    }
-    analyzer.write(StatementWrite::WidenCollections {
-        member_ids: member_ids.to_vec(),
-        incoming: CollectionWidening::Collection(incoming_type.clone()),
-    });
-    Some(())
-}
-
 pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_element_type(
     analyzer: &mut LuaAnalyzer,
     member_ids: &[LuaMemberId],
@@ -576,40 +571,26 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_eleme
     }
     analyzer.write(StatementWrite::WidenCollections {
         member_ids: member_ids.to_vec(),
-        incoming: CollectionWidening::Element(element_type.clone()),
+        element_type: element_type.clone(),
     });
     Some(())
 }
 
-/// What widens the members' collection types.
-#[derive(Debug, Clone)]
-pub(in crate::compilation::analyzer) enum CollectionWidening {
-    /// Another collection, whose element type joins theirs.
-    Collection(LuaType),
-    /// One more element.
-    Element(LuaType),
-}
-
-/// Widens each member's inferred collection type with `incoming`, against the
-/// types the members hold now; stops at the first member holding none.
+/// Widens each member's inferred collection type with `element_type`, skipping
+/// members that do not yet hold an inferred collection cache.
 pub(in crate::compilation::analyzer) fn widen_member_collections(
     db: &mut DbIndex,
     member_ids: &[LuaMemberId],
-    incoming: &CollectionWidening,
+    element_type: &LuaType,
 ) -> Option<()> {
-    let incoming_base = match incoming {
-        CollectionWidening::Collection(incoming_type) => {
-            normalize_infer_collection_type(db, incoming_type)?
-                .get_base()
-                .clone()
-        }
-        CollectionWidening::Element(element_type) => element_type.clone(),
-    };
     for member_id in member_ids {
-        let existing_cache = db
+        let Some(existing_cache) = db
             .get_type_index()
             .get_type_cache(&(*member_id).into())
-            .cloned()?;
+            .cloned()
+        else {
+            continue;
+        };
         if !existing_cache.is_infer() {
             continue;
         }
@@ -619,7 +600,7 @@ pub(in crate::compilation::analyzer) fn widen_member_collections(
             continue;
         };
 
-        let widened_base = TypeOps::Union.apply(db, existing_array.get_base(), &incoming_base);
+        let widened_base = TypeOps::Union.apply(db, existing_array.get_base(), element_type);
         // A widening that adds no element type says nothing new: rewriting the
         // member's own collection as an array would only change its form, and
         // the statement that wrote it would write it back.

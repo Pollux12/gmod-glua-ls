@@ -11122,8 +11122,8 @@ fn resolve_compilefile_target(
             })
             .min_by(|left, right| {
                 db.get_vfs()
-                    .get_file_path(left)
-                    .cmp(&db.get_vfs().get_file_path(right))
+                    .file_order_key(left)
+                    .cmp(&db.get_vfs().file_order_key(right))
                     .then_with(|| left.cmp(right))
             });
         if target.is_some() {

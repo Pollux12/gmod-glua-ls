@@ -4356,7 +4356,7 @@ mod tests {
             .outputs_of(id(2, 0))
             .map(|key| HashedKey::new(key.clone()))
             .collect::<Vec<_>>();
-        outputs.sort_by_key(|key| format!("{key:?}"));
+        outputs.sort_by_key(|key| format!("{:?}", key.key()));
         let producers = [20, 30, 40].map(|at| graph.producers(&decl(at)).collect::<Vec<_>>());
         assert_eq!(
             (outputs, producers),

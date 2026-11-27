@@ -9,32 +9,23 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use super::*;
 use crate::db_index::derivation::{self, CallRoleKey, Fingerprint};
 
-/// Where a file's contributions rank: files merge in path order, so the file
-/// that wins an entry two files define is a property of the source.
+/// Where a file's contributions rank: files merge in `Vfs::file_order_key`
+/// order (load tier first, then root and relative path), so where workspaces
+/// sit on disk never flips library-vs-workspace precedence.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FileRank(Arc<(String, String, u32)>);
+struct FileRank(Arc<(Arc<str>, u32)>);
 
 impl FileRank {
     fn of(db: &DbIndex, file_id: FileId) -> Self {
-        let raw_path = db
-            .get_vfs()
-            .get_file_path(&file_id)
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_default();
         Self(Arc::new((
-            crate::vfs::normalize_path_for_ordering(&raw_path),
-            raw_path,
+            db.get_vfs().file_order_key(&file_id),
             file_id.id,
         )))
     }
 
-    /// Whether `file_id` still ranks as `self`: it is at the path ranked.
+    /// Whether `file_id` still ranks as `self`: its order key is unchanged.
     fn holds(&self, db: &DbIndex, file_id: &FileId) -> bool {
-        db.get_vfs()
-            .get_file_path(file_id)
-            .map(|path| path.to_string_lossy())
-            .unwrap_or_default()
-            == self.0.1.as_str()
+        db.get_vfs().file_order_key(file_id) == self.0.0
     }
 }
 
