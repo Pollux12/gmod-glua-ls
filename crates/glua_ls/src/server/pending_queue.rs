@@ -110,21 +110,16 @@ impl PendingInitQueue {
                 let uri = params.text_document.uri;
                 let window = self.document_window_start();
                 let mut tail = self.messages.split_off(window);
-                let last_save = tail
-                    .iter()
-                    .rposition(|msg| {
-                        queued_doc(msg).is_some_and(|(_, doc_uri)| doc_uri == uri.as_str())
-                    })
-                    .filter(|position| {
-                        matches!(
-                            queued_doc(&tail[*position]),
-                            Some((DidSaveTextDocument::METHOD, _))
-                        )
-                    });
-                match last_save {
-                    Some(position) => tail[position] = Message::Notification(notification),
-                    None => tail.push(Message::Notification(notification)),
+                let last_save = tail.iter().rposition(|msg| {
+                    matches!(
+                        queued_doc(msg),
+                        Some((DidSaveTextDocument::METHOD, doc_uri)) if doc_uri == uri.as_str()
+                    )
+                });
+                if let Some(position) = last_save {
+                    tail.remove(position);
                 }
+                tail.push(Message::Notification(notification));
                 self.messages.append(&mut tail);
             }
             _ => self.messages.push(Message::Notification(notification)),
@@ -500,6 +495,28 @@ mod tests {
             methods_of(&messages),
             vec!["textDocument/didClose".to_string()],
             "within the window a new close supersedes the opens and closes queued before it"
+        );
+    }
+
+    #[test]
+    fn saves_do_not_accumulate_across_open_close_cycles() {
+        let mut queue = PendingInitQueue::new();
+        for cycle in 0..2 {
+            let version = cycle * 2;
+            queue.queue(open(version + 1, "local a = 1\n"));
+            queue.queue(change(version + 2, Some((0, 6, 0, 7)), "b"));
+            queue.queue(save(None));
+            queue.queue(close());
+        }
+
+        let messages = queue.take();
+        assert_eq!(
+            methods_of(&messages),
+            vec![
+                "textDocument/didSave".to_string(),
+                "textDocument/didClose".to_string()
+            ],
+            "each cycle's close supersedes its edits, and its save is superseded by the next save"
         );
     }
 
