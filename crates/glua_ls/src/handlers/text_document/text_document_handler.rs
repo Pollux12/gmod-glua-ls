@@ -117,7 +117,12 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
     }
 
     let mut write_analysis = context.analysis().write().await;
-    write_analysis.apply_fetched_schemas(url_contents);
+    let applied = write_analysis.apply_fetched_schemas(url_contents);
+    drop(write_analysis);
+    context
+        .debounced_analysis()
+        .rediagnose_schema_affected(applied.affected)
+        .await;
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -427,11 +432,12 @@ mod tests {
     use super::*;
     use crate::context::ServerContext;
     use crate::util::TempDir;
-    use glua_code_analysis::JsonSchemaFile;
+    use glua_code_analysis::{DiagnosticCode, JsonSchemaFile};
     use googletest::prelude::*;
     use lsp_server::Connection;
     use lsp_types::{
-        ClientCapabilities, SemanticTokensWorkspaceClientCapabilities, TextDocumentItem, Uri,
+        ClientCapabilities, NumberOrString, PublishDiagnosticsParams,
+        SemanticTokensWorkspaceClientCapabilities, TextDocumentItem, Uri,
         WorkspaceClientCapabilities,
     };
     use std::future::Future;
@@ -863,6 +869,36 @@ mod tests {
         )
     }
 
+    /// Whether the diagnostics the client was sent since the last poll carry
+    /// `code`; drains what it was sent.
+    fn was_published(peer: &Connection, code: DiagnosticCode) -> bool {
+        let code = Some(NumberOrString::String(code.get_name().to_string()));
+        peer.receiver.try_iter().any(|message| match message {
+            lsp_server::Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                serde_json::from_value::<PublishDiagnosticsParams>(notification.params).is_ok_and(
+                    |published| {
+                        published
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.code == code)
+                    },
+                )
+            }
+            _ => false,
+        })
+    }
+
+    fn schema_url(folder: &TempDir, name: &str) -> Url {
+        Url::parse(
+            glua_code_analysis::file_path_to_uri(&folder.join(name))
+                .expect("schema URI should parse")
+                .as_str(),
+        )
+        .expect("schema URL should parse")
+    }
+
     #[gtest]
     fn an_edited_schema_tag_resolves_without_a_save() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -870,14 +906,9 @@ mod tests {
             let (context, _peer, doc_uri, folder) =
                 context_with_main_workspace("schema_settled").await;
             let snapshot = context.snapshot();
-            let schema_path = folder.join("schema.json");
-            std::fs::write(&schema_path, SCHEMA_JSON).expect("schema file should be written");
-            let schema_url = Url::parse(
-                glua_code_analysis::file_path_to_uri(&schema_path)
-                    .expect("schema URI should parse")
-                    .as_str(),
-            )
-            .expect("schema URL should parse");
+            std::fs::write(folder.join("schema.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
+            let schema_url = schema_url(&folder, "schema.json");
 
             open(
                 &snapshot,
@@ -897,6 +928,38 @@ mod tests {
         })
     }
 
+    /// A document diagnosed before the background fetch resolved its schema is
+    /// diagnosed again once it resolves, so what only the schema makes wrong
+    /// reaches the client.
+    #[gtest]
+    fn a_schema_resolving_rediagnoses_the_document_that_uses_it() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, peer, doc_uri, folder) =
+                context_with_main_workspace("schema_rediagnosed").await;
+            let snapshot = context.snapshot();
+            std::fs::write(folder.join("schema.json"), SCHEMA_JSON)
+                .expect("schema file should be written");
+            let schema_url = schema_url(&folder, "schema.json");
+
+            open(
+                &snapshot,
+                &doc_uri,
+                1,
+                &format!(
+                    "---@schema {schema_url}\nlocal config = {{}}\nlocal port = config.missing\n"
+                ),
+            )
+            .await;
+
+            let rediagnosed = eventually(Duration::from_secs(10), || async {
+                was_published(&peer, DiagnosticCode::UndefinedField).then_some(())
+            })
+            .await;
+            verify_that!(rediagnosed, some(eq(())))
+        })
+    }
+
     #[gtest]
     fn a_missing_schema_file_resolves_on_the_save_after_its_creation() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -904,16 +967,8 @@ mod tests {
             let (context, _peer, doc_uri, folder) =
                 context_with_main_workspace("schema_retry").await;
             let snapshot = context.snapshot();
-            let schema_url = |name: &str| {
-                Url::parse(
-                    glua_code_analysis::file_path_to_uri(&folder.join(name))
-                        .expect("schema URI should parse")
-                        .as_str(),
-                )
-                .expect("schema URL should parse")
-            };
-            let good_url = schema_url("good.json");
-            let missing_url = schema_url("missing.json");
+            let good_url = schema_url(&folder, "good.json");
+            let missing_url = schema_url(&folder, "missing.json");
             std::fs::write(folder.join("good.json"), SCHEMA_JSON)
                 .expect("schema file should be written");
 

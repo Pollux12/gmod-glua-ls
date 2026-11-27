@@ -47,7 +47,7 @@ use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
 pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
-use url::Url;
+pub use url::Url;
 pub use vfs::*;
 
 /// Stack size for any thread that runs analysis.
@@ -279,6 +279,15 @@ pub struct ConfigApplied {
     pub shared: EmmyrcChange,
     /// The files of the roots whose own config reaches the index, sorted.
     pub files: Vec<FileId>,
+}
+
+/// What applying fetched schema content reached.
+#[derive(Debug, Default)]
+pub struct AppliedSchemas {
+    /// The urls whose content converted and whose schema now resolves.
+    pub resolved: Vec<Url>,
+    /// The live files whose diagnostics may have changed, sorted.
+    pub affected: Vec<FileId>,
 }
 
 #[derive(Debug)]
@@ -580,14 +589,20 @@ impl EmmyLuaAnalysis {
         affected
     }
 
-    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
+    /// Sets a remote file's text and re-analyses it. Returns the file and every
+    /// live file whose diagnostics may have changed.
+    pub fn update_remote_file_by_uri(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+    ) -> (FileId, Vec<FileId>) {
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_remote_file_content(uri, text);
-        self.reindex_files(vec![file_id]);
-        file_id
+        let affected = self.reindex_files(vec![file_id]);
+        (file_id, affected)
     }
 
     /// Sets every file's text in one batch and re-analyses them together.
@@ -1028,9 +1043,12 @@ impl EmmyLuaAnalysis {
             .get_need_resolve_schemas()
     }
 
-    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) {
+    /// Applies the content fetched for each schema url. Reports which urls now
+    /// resolve and every live file whose diagnostics may have changed.
+    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) -> AppliedSchemas {
+        let mut applied = AppliedSchemas::default();
         if url_contents.is_empty() {
-            return;
+            return applied;
         }
 
         let converter = SchemaConverter::new(true);
@@ -1046,8 +1064,9 @@ impl EmmyLuaAnalysis {
                             continue;
                         }
                     };
-                    let file_id =
+                    let (file_id, affected) =
                         self.update_remote_file_by_uri(&uri, Some(convert_result.annotation_text));
+                    applied.affected.extend(affected);
                     if let Some(f) = self
                         .compilation
                         .get_db_mut()
@@ -1065,6 +1084,7 @@ impl EmmyLuaAnalysis {
                             .get_json_schema_index()
                             .users_of(&url),
                     );
+                    applied.resolved.push(url);
                 }
                 Err(e) => {
                     log::error!("Failed to convert schema from URL {:?}: {}", url, e);
@@ -1073,8 +1093,11 @@ impl EmmyLuaAnalysis {
         }
 
         if !users.is_empty() {
-            self.reindex_files(users);
+            applied.affected.extend(self.reindex_files(users));
         }
+        applied.affected.sort_unstable();
+        applied.affected.dedup();
+        applied
     }
 
     pub async fn update_schema(&mut self) {

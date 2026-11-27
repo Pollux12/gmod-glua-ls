@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc::UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
 
 use super::schema_fetcher::SchemaFetcher;
@@ -1032,6 +1032,28 @@ impl DebouncedAnalysis {
         refresh_open_document_features(&self.client, &self.lsp_features);
     }
 
+    /// Re-diagnoses the files a schema applied outside the edit loop moved.
+    pub async fn rediagnose_schema_affected(&self, affected: Vec<FileId>) {
+        if !affected.is_empty() {
+            self.refresh_affected(&[], affected).await;
+        }
+    }
+
+    /// Re-diagnoses what a background schema fetch changed, once its
+    /// re-analysis reports the files the newly resolved schemas moved.
+    pub async fn rediagnose_fetched_schemas(&self, mut applied: UnboundedReceiver<Vec<FileId>>) {
+        loop {
+            let received = tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                received = applied.recv() => received,
+            };
+            let Some(affected) = received else {
+                return;
+            };
+            self.rediagnose_schema_affected(affected).await;
+        }
+    }
+
     /// Background loop: waits for edits, debounces them, takes them into the
     /// re-analysis, then settles it in slices that release the analysis lock,
     /// so requests run between them. New edits pre-empt the slices and are
@@ -1303,6 +1325,7 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
+    use crate::context::diagnostic_store::Priority;
     use crate::context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar};
 
     use super::DebouncedAnalysis;
@@ -2787,6 +2810,30 @@ mod tests {
             verify_that!(
                 debounced_analysis.file_is_answerable(&changed[0]).await,
                 eq(true)
+            )
+        })
+    }
+
+    /// A schema the background fetch resolved re-diagnoses the files it moved,
+    /// without waiting for the next edit.
+    #[gtest]
+    fn a_resolved_schema_rediagnoses_the_files_it_moved() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let affected = FileId::new(1);
+            let (sender, applied) = tokio::sync::mpsc::unbounded_channel();
+            sender.send(vec![affected]).expect("the receiver is held");
+            drop(sender);
+
+            debounced_analysis.rediagnose_fetched_schemas(applied).await;
+
+            verify_that!(
+                debounced_analysis
+                    .file_diagnostic
+                    .store()
+                    .dirty_priority(affected),
+                some(eq(Priority::Closed))
             )
         })
     }

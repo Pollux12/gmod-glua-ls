@@ -188,8 +188,10 @@ impl ServerContext {
             client.clone(),
         ));
         let debounced_shutdown = CancellationToken::new();
-        let schema_fetch = background_tasks
-            .then(|| SchemaFetcher::spawn(analysis.clone(), debounced_shutdown.clone()));
+        let (schema_applied, schema_applied_rx) = tokio::sync::mpsc::unbounded_channel();
+        let schema_fetch = background_tasks.then(|| {
+            SchemaFetcher::spawn(analysis.clone(), debounced_shutdown.clone(), schema_applied)
+        });
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis.clone(),
             200,
@@ -199,6 +201,14 @@ impl ServerContext {
             lsp_features.clone(),
             schema_fetch,
         ));
+        if background_tasks {
+            let debounced_analysis = debounced_analysis.clone();
+            tokio::spawn(async move {
+                debounced_analysis
+                    .rediagnose_fetched_schemas(schema_applied_rx)
+                    .await;
+            });
+        }
         let workspace_manager_inner = WorkspaceManager::new(
             analysis.clone(),
             client.clone(),
