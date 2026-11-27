@@ -120,7 +120,10 @@ use crate::{
     FileId,
     db_index::{DbIndex, LuaType},
 };
-use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaTypeOwner};
+use crate::{
+    LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaTypeCache,
+    LuaTypeOwner,
+};
 pub use generic::*;
 pub use gmod_hook_owner::{BUILTIN_HOOK_OWNERS, gmod_hook_owner_group, gmod_hook_owner_group_of};
 pub use guard::{InferGuard, InferGuardRef};
@@ -686,6 +689,43 @@ impl<'a> SemanticModel<'a> {
             .iter()
             .position(|candidate| candidate.syntax() == target.syntax())?;
         self.infer_expr_list_value_type_at(&exprs, target_idx)
+    }
+
+    /// Returns the doc-annotated type bound to `target` when it is the left
+    /// side of a plain `=` assignment whose statement carries a binding doc
+    /// tag (e.g. `---@type GlideWheelBoneConfig[]` on `ENT.WheelBones = nil`).
+    ///
+    /// The annotation owns the target owner's type cache, so features that
+    /// describe the write itself can prefer this over
+    /// [`Self::infer_plain_assignment_target_value`], which projects the raw
+    /// RHS (`nil` for an annotation-only delete).
+    pub fn plain_assignment_target_doc_type(&self, target: &LuaVarExpr) -> Option<LuaType> {
+        let assign_stat = LuaAssignStat::cast(target.syntax().parent()?)?;
+        if assign_stat.get_assign_op()?.get_token_kind() != LuaTokenKind::TkAssign {
+            return None;
+        }
+
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        let var_idx = vars
+            .iter()
+            .position(|candidate| candidate.syntax() == target.syntax())?;
+        if !crate::compilation::analyzer::assign_stat_var_carries_doc_type(&assign_stat, var_idx) {
+            return None;
+        }
+
+        let owner = match target {
+            LuaVarExpr::NameExpr(name_expr) => LuaTypeOwner::Decl(LuaDeclId::new(
+                self.file_id,
+                name_expr.get_name_token()?.get_position(),
+            )),
+            LuaVarExpr::IndexExpr(index_expr) => {
+                LuaTypeOwner::Member(LuaMemberId::new(index_expr.get_syntax_id(), self.file_id))
+            }
+        };
+        match self.db.get_type_index().get_type_cache(&owner)? {
+            LuaTypeCache::DocType(typ) => Some(typ.clone()),
+            LuaTypeCache::InferType(_) => None,
+        }
     }
 
     pub fn infer_call_arg_expr_list_types(
